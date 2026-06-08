@@ -1,0 +1,6 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "sh /home/vibe/.claude/statusline-command.sh"
+  }
+}

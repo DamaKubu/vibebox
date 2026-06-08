@@ -1,0 +1,7 @@
+# Normalize text, but anything that runs inside the Linux container MUST stay LF
+# (CRLF breaks shell scripts / configs when checked out on Windows).
+* text=auto
+*.sh        text eol=lf
+*.conf      text eol=lf
+Containerfile text eol=lf
+*.py        text eol=lf
