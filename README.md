@@ -16,10 +16,41 @@ folder is invisible, and the network mode is fixed by whoever launches it.
 Because the container is the boundary, the agent runs with
 `--dangerously-skip-permissions` — no in-app prompts, full freedom, contained.
 
+## Install Podman
+The launcher shells out to `podman`, so you need it once.
+- **Windows:** `winget install RedHat.Podman-Desktop` (or `RedHat.Podman` for CLI
+  only), then initialise + start the backing Linux VM:
+  ```powershell
+  podman machine init
+  podman machine start
+  ```
+- **macOS:** `brew install podman` then the same `podman machine init/start`.
+- **Linux:** `sudo apt install podman` (or your distro's package) — runs natively,
+  no VM.
+
+### Resources (Windows/macOS: mind the VM)
+On Windows/macOS the container runs inside a Linux VM (WSL2 on Windows), and **that
+VM — not your hardware — caps what the box can use.** vibebox prints the ceiling at
+launch, e.g. `cpus=4 ram=7.8GB`. To raise it on Windows, create
+`%USERPROFILE%\.wslconfig`:
+```ini
+[wsl2]
+memory=16GB
+processors=8
+```
+then `wsl --shutdown` and `podman machine stop; podman machine start`.
+
 ## One-time build
 ```powershell
 podman build -t vibebox:latest -f vibebox/Containerfile vibebox
 ```
+
+### Updating the agent
+The container is **ephemeral** (`--rm`) and the **image is the source of truth**, so
+you update Claude Code by rebuilding the image — just re-run the build above. The
+in-box auto-updater is disabled on purpose (`DISABLE_AUTOUPDATER=1`): it runs as a
+non-root user that can't write npm's global prefix, so it could only ever fail with a
+nag, and any update it did manage would vanish when the `--rm` container exits.
 
 ## Use
 The launcher is a single portable Python script — same command on Windows, Linux,

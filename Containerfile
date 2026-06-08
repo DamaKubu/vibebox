@@ -22,6 +22,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (safe here — the container is the boundary).
 RUN npm install -g @anthropic-ai/claude-code
 
+# The container is ephemeral (--rm) and runs as uid 1000, which can't write the
+# root-owned npm prefix — so the in-box auto-updater only ever fails with a nag.
+# The image is the source of truth: update by rebuilding, not in place. Disable it.
+ENV DISABLE_AUTOUPDATER=1
+
 # Non-root: claude refuses --dangerously-skip-permissions as root, and uid 1000
 # pairs with `podman run --userns=keep-id` so files in /work stay host-owned.
 # The node base image already ships a uid-1000 user; drop it before reusing the id.

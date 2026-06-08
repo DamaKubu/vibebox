@@ -73,6 +73,17 @@ def _ensure_network(name, internal=False):
         subprocess.run(args, check=True)
 
 
+def machine_resources():
+    """Best-effort 'cpus=N ram=X.XGB' the box can use (the WSL VM caps these)."""
+    try:
+        out = subprocess.run(["podman", "info", "--format", "{{.Host.CPUs}} {{.Host.MemTotal}}"],
+                             capture_output=True, text=True, timeout=10)
+        cpus, mem = out.stdout.split()
+        return f"cpus={cpus} ram={int(mem) / 1e9:.1f}GB"
+    except Exception:
+        return ""
+
+
 def resolve_credentials(mount_login=False):
     """(api_key, creds_home, cleanup_dir). ANTHROPIC_API_KEY passes through if set.
     The host ~/.claude.json login is copied in ONLY when mount_login (-creds): a
@@ -161,7 +172,9 @@ def main(argv=None):
                    cpu=args.cpu, disk=args.disk, gpu=args.gpu, claude=args.claude,
                    creds_home=creds_home, api_key=api_key, interactive=interactive)
     cmd = build_podman_command(opts)
-    print(f"vibebox: net={' '.join(net)}{' | gpu' if args.gpu else ''} | {opts.work} -> /work")
+    res = machine_resources()
+    print(f"vibebox: net={' '.join(net)}{' | gpu' if args.gpu else ''}"
+          f"{' | ' + res if res else ''} | {opts.work} -> /work")
     if not args.claude:
         print("         (run 'claude --dangerously-skip-permissions' inside to start the agent)")
     try:
