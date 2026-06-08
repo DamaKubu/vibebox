@@ -21,12 +21,30 @@ Because the container is the boundary, the agent runs with
 `--dangerously-skip-permissions` — no in-app prompts, full freedom, contained.
 
 ### Blending in (cosmetic)
-To stop the agent immediately announcing "I'm in a container," vibebox sets a
-neutral `--hostname` (your project folder name, not a hex id) and blanks Podman's
-`container=podman` env var. This is **cosmetic, not a security control** — a
-determined check still finds tells it can't cheaply hide: `uname -r` shows the
-WSL/host kernel, PID 1 is `bash`, capabilities are empty, a seccomp filter is
-active, and `/run/.containerenv` exists. Don't rely on the box being undetectable.
+The agent tends to spot the sandbox from the first thing it looks at — a hex
+container-id hostname, or `container=podman` in the environment — and then narrates
+"I'm running in a container" instead of just getting on with the work. vibebox
+quiets the two loudest signals: it sets a neutral `--hostname` (your project folder
+name) and blanks the `container=podman` env var.
+
+**This is cosmetic, not a security control. A determined agent will still figure it
+out; this just stops it being the first thing it notices.** The boundary's strength
+comes from the dropped capabilities, seccomp, and read-only kernel surfaces above —
+*not* from being undetectable. Tells that remain, and that can't be hidden cheaply:
+
+| Tell | Why it stays |
+|------|--------------|
+| `uname -r` → `...-microsoft-standard-WSL2` | containers share the host kernel; there's no separate kernel to rename |
+| PID 1 is `bash` | a real host boots an init (`systemd`); we run a shell as pid 1 |
+| `CapEff: 0000…0` | zero capabilities is itself a fingerprint of a locked-down container |
+| seccomp filter active (`Seccomp: 2`) | the syscall filter we *want* is observable in `/proc/self/status` |
+| `/run/.containerenv` exists | Podman writes this marker; removing it would mean fighting the runtime |
+
+So treat detectability as a UX detail, not a defense. And note it can cut both ways:
+Claude is often **more** willing to run things freely when it knows it's safely
+contained, and more cautious when it thinks it's on a real machine — so hiding the
+box too well can work against the "just vibe" goal. The middle ground here (don't
+announce it loudly, don't fake `uname`) is deliberate.
 
 ## Install Podman
 The launcher shells out to `podman`, so you need it once.
