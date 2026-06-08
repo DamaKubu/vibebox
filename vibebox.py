@@ -35,6 +35,7 @@ class Options:
     creds_home: str = ""  # temp home with throwaway .claude.json + .claude/
     api_key: str = ""     # if set, passed as ANTHROPIC_API_KEY instead of creds
     interactive: bool = True  # tty; False = scriptable (piped stdin)
+    hostname: str = "devbox"  # neutral name (hides the hex container-id tell)
 
 
 def build_podman_command(opts):
@@ -45,6 +46,9 @@ def build_podman_command(opts):
         "-w", "/work",
         "--userns=keep-id",
     ] + HARDENING
+    # Block dmesg (kernel-log leak) and shave the loudest container tells.
+    cmd += ["--security-opt", f"seccomp={SECCOMP}",
+            "--hostname", opts.hostname, "-e", "container="]
     cmd += _network_args(opts.net)
     cmd += _limit_args(opts)
     if opts.gpu:
@@ -168,9 +172,11 @@ def main(argv=None):
 
     api_key, creds_home, cleanup = resolve_credentials(args.creds)
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    host = re.sub(r"[^A-Za-z0-9-]", "-", os.path.basename(os.getcwd())).strip("-") or "devbox"
     opts = Options(work=os.getcwd(), image=args.image, net=net, ram=args.ram,
                    cpu=args.cpu, disk=args.disk, gpu=args.gpu, claude=args.claude,
-                   creds_home=creds_home, api_key=api_key, interactive=interactive)
+                   creds_home=creds_home, api_key=api_key, interactive=interactive,
+                   hostname=host)
     cmd = build_podman_command(opts)
     res = machine_resources()
     print(f"vibebox: net={' '.join(net)}{' | gpu' if args.gpu else ''}"
@@ -202,6 +208,10 @@ PROXY_PORT = 8080
 
 # Single source of truth for hardening — shared by the sandbox and the proxy.
 HARDENING = ["--cap-drop=ALL", "--security-opt", "no-new-privileges"]
+
+# Pinned seccomp: podman's default profile with the `syslog` syscall removed, so
+# in-box code can't read the host kernel ring buffer (dmesg). Sandbox-only.
+SECCOMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seccomp.json")
 
 
 def build_proxy_command(image, allow_file, conf):

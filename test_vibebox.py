@@ -143,6 +143,18 @@ def test_never_contains_dangerous_escapes():
     assert "--cap-drop=ALL" in c and "no-new-privileges" in c and "--userns=keep-id" in c
 
 
+# --- Cycle 17: seccomp + blend-in (block dmesg, shave loudest container tells) -
+
+def test_seccomp_profile_and_blend_flags():
+    c = cmd(hostname="myproj")
+    # custom seccomp profile (default minus syslog) is applied to the sandbox
+    assert any(a.startswith("seccomp=") and a.endswith("seccomp.json") for a in c)
+    # neutral hostname instead of the hex container id
+    assert c[c.index("--hostname") + 1] == "myproj"
+    # podman's container=podman tell is blanked
+    assert "container=" in c
+
+
 # --- Cycle 16: tty gating (scriptable when not attached to a terminal) -------
 
 def test_interactive_default_allocates_tty():

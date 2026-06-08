@@ -10,11 +10,23 @@ folder is invisible, and the network mode is fixed by whoever launches it.
 - **Network:** you choose `full` / `none` / an `allow`-list at launch. The agent
   inside has dropped caps, no podman socket, no new privileges — it **cannot
   change the network mode** you set.
-- **Privilege:** runs as non-root uid 1000, `--cap-drop=ALL`,
-  `--security-opt no-new-privileges`.
+- **Privilege:** runs as non-root uid 1000, `--cap-drop=ALL` (zero capabilities),
+  `--security-opt no-new-privileges`, plus a pinned **seccomp** profile.
+- **Kernel:** with no capabilities, in-box code can't load modules, mount, create
+  device nodes, touch `/dev/mem`, or write `/proc/sys` — the host kernel can't be
+  modified. The seccomp profile (`seccomp.json`) is Podman's default with the
+  `syslog` syscall removed, so `dmesg` can't read the host kernel ring buffer.
 
 Because the container is the boundary, the agent runs with
 `--dangerously-skip-permissions` — no in-app prompts, full freedom, contained.
+
+### Blending in (cosmetic)
+To stop the agent immediately announcing "I'm in a container," vibebox sets a
+neutral `--hostname` (your project folder name, not a hex id) and blanks Podman's
+`container=podman` env var. This is **cosmetic, not a security control** — a
+determined check still finds tells it can't cheaply hide: `uname -r` shows the
+WSL/host kernel, PID 1 is `bash`, capabilities are empty, a seccomp filter is
+active, and `/run/.containerenv` exists. Don't rely on the box being undetectable.
 
 ## Install Podman
 The launcher shells out to `podman`, so you need it once.
