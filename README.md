@@ -88,22 +88,13 @@ and macOS. It drops you into a `bash` shell by default; run
 `claude --dangerously-skip-permissions` inside (or pass `-claude`) to start the agent.
 ```bash
 cd /path/to/new-idea
-python C:\Users\IT Logika\documents\projects\vibebox\vibebox.py            # shell, full internet
+python C:\path\to\vibebox\vibebox.py            # shell, full internet
 python C:\...\vibebox.py -claude                                          # straight into the agent
 python C:\...\vibebox.py -net none                                        # air-gapped
 python C:\...\vibebox.py -net claude,pypi -ram 5GB                        # allowlist + limits
 python C:\...\vibebox.py -net claude -creds -claude                       # safe combo: agent, login mounted, egress locked
 ```
 
-Make it a one-word command. **PowerShell** (`notepad $PROFILE`):
-```powershell
-function vibebox { python "C:\Users\IT Logika\documents\projects\vibebox\vibebox.py" @args }
-```
-**bash/zsh** (`~/.bashrc` / `~/.zshrc`):
-```bash
-vibebox() { python /path/to/vibebox/vibebox.py "$@"; }
-```
-Then just `vibebox` from any project dir.
 
 ## Auth
 **Credentials are not put in the box by default** — you opt in.
