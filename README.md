@@ -1,8 +1,23 @@
 # vibebox
 
-A project-independent Podman sandbox. `cd` into any idea, launch, and vibe with
-an agent **inside** the container — the host filesystem outside the current
-folder is invisible, and the network mode is fixed by whoever launches it.
+A simple, secure Podman sandbox for running the [opencode](https://opencode.ai)
+agent against a **local LLM**. `cd` into any project, launch, and let the agent
+work **inside** the container — the host filesystem outside the current folder is
+invisible, no credentials are put in the box, and the network mode is fixed by
+whoever launches it (locked to just the LLM host by default).
+
+## Quick start
+```bash
+python3 vibebox.py -install        # once: puts a `vibe` command in ~/.local/bin
+$EDITOR ~/.vibebox/llm.env         # once: LOCAL_LLM_URL / LOCAL_LLM_MODEL / LOCAL_LLM_API_KEY
+cd ~/some/project && vibe          # opencode in the box; builds the image if needed
+```
+`vibe -sh` gives a bash shell instead, `vibe -log` shows what the box tried to reach.
+**Switch models inside opencode with `/models`**: at launch vibe asks the endpoint
+for `GET <LOCAL_LLM_URL>/models` and offers every chat model (embedding, speech,
+OCR and rerank models are left out); `LOCAL_LLM_MODEL` is the default. If the list
+can't be fetched you get a one-line warning and just the default model.
+vibe refuses to run in `$HOME` or `/`, so your whole home dir is never mounted.
 
 ## What's protected
 - **Filesystem:** only `$PWD` is mounted (`/work`). Host home, other projects,
@@ -17,8 +32,8 @@ folder is invisible, and the network mode is fixed by whoever launches it.
   modified. The seccomp profile (`seccomp.json`) is Podman's default with the
   `syslog` syscall removed, so `dmesg` can't read the host kernel ring buffer.
 
-Because the container is the boundary, the agent runs with
-`--dangerously-skip-permissions` — no in-app prompts, full freedom, contained.
+Because the container is the boundary, opencode runs with every permission set to
+`allow` — no in-app prompts, full freedom, contained.
 
 ### Blending in (cosmetic)
 The agent tends to spot the sandbox from the first thing it looks at — a hex
@@ -41,7 +56,7 @@ comes from the dropped capabilities, seccomp, and read-only kernel surfaces abov
 | `/run/.containerenv` exists | Podman writes this marker; removing it would mean fighting the runtime |
 
 So treat detectability as a UX detail, not a defense. And note it can cut both ways:
-Claude is often **more** willing to run things freely when it knows it's safely
+an agent is often **more** willing to run things freely when it knows it's safely
 contained, and more cautious when it thinks it's on a real machine — so hiding the
 box too well can work against the "just vibe" goal. The middle ground here (don't
 announce it loudly, don't fake `uname`) is deliberate.
@@ -70,58 +85,146 @@ processors=8
 ```
 then `wsl --shutdown` and `podman machine stop; podman machine start`.
 
-## One-time build
-```powershell
-podman build -t vibebox:latest -f vibebox/Containerfile vibebox
-```
+## Image build
+Automatic: `vibe` builds `vibebox:latest` on first use and rebuilds it whenever
+the `Containerfile` or `opencode/` changes (it labels the image with a hash of
+both). By hand: `podman build -t vibebox:latest .`
+The image is `debian:bookworm-slim` + apt dev tools + uv + the standalone opencode
+binary (pinned, Bun bundled) + `ty` for Python diagnostics. **No Node/npm.**
+opencode installs its plugin SDK (`@opencode-ai/plugin`) into its config dir on
+every start; the build does that once so runs never call `registry.npmjs.org`.
 
-### Updating the agent
-The container is **ephemeral** (`--rm`) and the **image is the source of truth**, so
-you update Claude Code by rebuilding the image — just re-run the build above. The
-in-box auto-updater is disabled on purpose (`DISABLE_AUTOUPDATER=1`): it runs as a
-non-root user that can't write npm's global prefix, so it could only ever fail with a
-nag, and any update it did manage would vanish when the `--rm` container exits.
+### Updating
+The container is **ephemeral** (`--rm`) and the **image is the source of truth**:
+bump `OPENCODE_VERSION` / `TY_VERSION` in the `Containerfile` and rebuild. opencode's
+self-update is disabled in the box.
 
 ## Use
-The launcher is a single portable Python script — same command on Windows, Linux,
-and macOS. It drops you into a `bash` shell by default; run
-`claude --dangerously-skip-permissions` inside (or pass `-claude`) to start the agent.
+The launcher is a single portable Python script (`vibe` after `-install`; on
+Windows run `python vibebox.py ...`). With an LLM configured it starts opencode;
+without one, or with `-sh`, you get a `bash` shell.
 ```bash
 cd /path/to/new-idea
-python C:\path\to\vibebox\vibebox.py            # shell, full internet
-python C:\...\vibebox.py -claude                                          # straight into the agent
-python C:\...\vibebox.py -net none                                        # air-gapped
-python C:\...\vibebox.py -net claude,pypi -ram 5GB                        # allowlist + limits
-python C:\...\vibebox.py -net claude -creds -claude                       # safe combo: agent, login mounted, egress locked
+vibe                                                # opencode, only the LLM host reachable
+vibe -sh                                            # bash shell (run `opencode` inside)
+vibe -llm http://100.x.y.z:8080/v1 -net pypi -ram 5GB   # other LLM, + pypi, limits
+vibe -sh -net none                                  # air-gapped shell (no LLM)
 ```
+Other flags: `-model ID`, `-gpu`, `-cpu N`, `-disk 10GB`, `-log`, `-stop-proxy`, `-clean`.
+
+### herdr
+Inside a [herdr](https://herdr.dev) pane, `vibe` marks the pane as an opencode
+agent (`HERDR_AGENT=opencode` on the podman process, so herdr reads opencode's
+idle/working/blocked state from the screen) and reports display metadata: name
+`vibe:<model>`, title `vibe <project> | <model> | net: <host>`, and tokens
+`project`, `model`, `net` you can use in herdr's sidebar rows. It is cleared on
+exit. The model shown is the launch default; opencode's own terminal title
+(`OC | <session title>`) doesn't include the model, so a `/models` switch isn't
+reflected. Outside herdr nothing is sent.
+
+## opencode + local model
+opencode is preconfigured for a local OpenAI-compatible server (llama.cpp `llama-server`, Ollama, ...) — typically on
+another machine on your LAN or tailnet. Build once (same command as above), then:
+```bash
+vibe -llm http://100.x.y.z:8080/v1             # llama-server
+vibe -llm http://100.x.y.z:11434/v1            # Ollama
+vibe -llm http://100.x.y.z:8080/v1 -net pypi,npm   # allowlist: LLM host auto-added
+```
+`-llm` sets `LOCAL_LLM_URL` and `-model` sets `LOCAL_LLM_MODEL` in the box. Each
+falls back to the host env var, then to `~/.vibebox/llm.env` (see below).
+Config lives in `opencode/opencode.json` (baked to `~/.config/opencode/`): provider
+`local`, model `local/{env:LOCAL_LLM_MODEL}`; the launcher adds the rest of the
+endpoint's models through `OPENCODE_CONFIG_CONTENT` (inline JSON opencode merges
+over its config), each with `limit: {context: 100000, output: 8192}` (Scaleway
+rejects opencode's larger default output; a server-reported context such as
+llama.cpp's `n_ctx_train` is used when present) (opencode substitutes `{env:...}` as
+raw text, so it works in the model key; the image defaults it to `local`), all
+permissions `allow`, so the box is the boundary.
+Python diagnostics come from Astral's `ty` (Rust, configured under `lsp`); the
+built-in `pyright`/`typescript` servers are disabled and LSP downloads are off.
+- **Listen on the LAN**, not loopback: `llama-server --host 0.0.0.0 ...` /
+  `OLLAMA_HOST=0.0.0.0 ollama serve`.
+- **Use the Tailscale 100.x IP**, not the MagicDNS name — it may not resolve
+  inside the container.
+- **Ollama:** the model id must be a real tag: `-model qwen2.5-coder:32b`.
+  llama-server serves one model and ignores the id.
+- **Network:** any LLM URL (flag, env or llm.env) with no `-net` is **locked down**: the only
+  reachable host is the LLM server. `-net full` lifts that; `-net none` is refused;
+  any other allowlist gets the LLM host added (plain `http://` works on any port;
+  `https://` only on 443).
+
+### Hosted provider (Scaleway)
+Any OpenAI-compatible API works the same way. For
+[Scaleway Generative APIs](https://www.scaleway.com/en/docs/generative-apis/) the
+base URL is `https://api.scaleway.ai/v1` and the IAM **secret key** is sent as
+`Authorization: Bearer <key>`. A Managed Inference deployment uses its own
+endpoint URL instead (`https://<deployment-id>.ifr.fr-par.scaleway.com/v1`).
+1. The first launch creates `~/.vibebox/llm.env` (mode 0600, commented template).
+   Fill it in:
+   ```ini
+   LOCAL_LLM_URL=https://api.scaleway.ai/v1
+   LOCAL_LLM_MODEL=<model-id>
+   LOCAL_LLM_API_KEY=<secret-key>
+   ```
+2. `vibe`. The box is locked to `api.scaleway.ai:443`.
+
+Precedence per key: CLI flag > host env var > file. The launcher warns if the file
+is group/world-readable. The key is never printed and never put on the podman
+command line (which `ps` shows): podman gets `-e LOCAL_LLM_API_KEY` by name and
+copies the value from its own environment. Without a key the image default `local`
+is used, which llama.cpp/Ollama ignore.
+
+vibe lists these for you inside opencode (`/models`). By hand:
+```bash
+curl -s https://api.scaleway.ai/v1/models -H "Authorization: Bearer $SCW_SECRET_KEY" | jq -r '.data[].id'
+```
+**Privacy:** unlike a local model, every prompt, including the code and files the
+agent reads, goes to the provider. Check their data-retention terms before using
+it on code you can't share.
+
+### What leaves the box
+- **Locked down / allowlist:** the box sits on an internal network with no route
+  out and **no DNS** (`--disable-dns` network + `--dns=none`, so DNS can't be used
+  to tunnel data out). The only way out is the proxy, at a fixed IP. Tools that
+  ignore `HTTP_PROXY` just fail. Allowed hosts are the only destinations, but
+  **anything can be sent to them**, including your code: that's the LLM's job.
+- **Egress log:** every proxied request is written to
+  `~/.vibebox/logs/egress-<time>.log` (host:port for HTTPS, the full URL for plain
+  HTTP), including blocked ones. The banner shows the path. On exit you get a
+  one-line summary (hosts requested, number denied). `vibe -log` prints the
+  latest log with blocked lines marked `DENIED`.
+- **`-net full`:** unrestricted and **not logged**.
+- **No phoning home:** the image sets `OPENCODE_DISABLE_MODELS_FETCH`,
+  `OPENCODE_DISABLE_AUTOUPDATE`, `OPENCODE_DISABLE_DEFAULT_PLUGINS` and
+  `OPENCODE_DISABLE_LSP_DOWNLOAD`. `opencode.json` has `share: disabled`.
+
+**Default tools in the image:** git, python3 (+pip, venv), uv/uvx, ty,
+build-essential (gcc/make), ripgrep, fd, tree, file, curl, wget, jq, less, nano,
+unzip/zip, xz, patch, procps, sqlite3, openssh-client, opencode.
+
+**Node/npm is not included** (it kept the image ~2.6x bigger). If a project needs
+JS, add it per project — e.g. download a Node tarball into `/work` with
+`-net full` (or allowlist `nodejs.org,npm`), or build a derived image
+`FROM vibebox:latest` that installs it.
 
 
-## Auth
-**Credentials are not put in the box by default** — you opt in.
-- **API key:** set `$env:ANTHROPIC_API_KEY` on the host; it's passed through (no flag needed).
-- **Subscription/OAuth:** pass `-creds` to copy your host `~/.claude.json` login into a
-  throwaway per-process home and mount it. Without it (and without a key), claude
-  prompts you to log in inside the box.
-- **No flag, no key:** no credentials in the box at all.
-
-> ⚠️ **Read this before using `-creds` or an API key.** The container protects your
-> *host filesystem*, not the credential you hand *in*. Anything running inside the box
-> (the agent runs `--dangerously-skip-permissions`, so it freely executes untrusted
-> code) can read that token, and with full egress can send it anywhere. **If you mount
-> a credential, lock the network: `-net claude`** — then the token has nowhere to go but
-> Anthropic. Better still, use a **scoped, revocable** `ANTHROPIC_API_KEY` so a leak
-> costs capped API spend, not your account. `-net full` + creds = exfiltration-ready.
+## Credentials
+None by default. The box gets no logins from the host. The only things passed in
+are `LOCAL_LLM_URL`, `LOCAL_LLM_MODEL` and, if you configured a hosted provider,
+`LOCAL_LLM_API_KEY`. The agent can read that key, so use a scoped key you can revoke. Remember the agent can still send your code to any host you
+allowlist — that's the LLM's job — so keep `-net` tight.
 
 ## Network modes
 | `-net`            | effect | when |
 |-------------------|--------|------|
-| `full`            | default bridge, full egress | normal vibing (pip/npm/git/API just work) |
+| `full`            | default bridge, full egress | normal vibing (pip/git just work) |
 | `none`            | `--network=none`, air-gapped | offline compute, max safety |
 | comma list        | allowlisted egress (proxy) | only the named hosts reachable |
 
 For the allowlist, pass a comma-separated list of keywords/domains, e.g.
-`-net claude,pypi,github`. Keywords expand to known host sets
-(`claude`, `duckduckgo`, `github`, `pypi`, `npm`); anything containing a `.` is
+`-net pypi,github`. Keywords expand to known host sets
+(`duckduckgo`, `github`, `pypi`, `npm`); anything containing a `.` is
 treated as a raw domain. The sandbox is forced onto an internal (no-egress)
 network and its only way out is a hardened tinyproxy sidecar that CONNECT-filters
 on host (no TLS interception, no CA needed). Tear it down with `-stop-proxy`.
+The box gets no DNS in this mode; the proxy resolves allowed names itself.

@@ -1,45 +1,92 @@
-# vibebox — project-independent sandbox for vibing with agents inside Podman.
-# Polyglot dev tools + the Claude Code CLI. The container IS the safety boundary,
-# so the agent runs with in-app permission prompts skipped (--dangerously-skip-
-# permissions, set by the launcher) — it can do anything it likes, but only to
-# the single mounted project dir, with whatever network the invoker granted.
+# vibebox — simple, secure, project-independent sandbox for running the opencode
+# agent against a local LLM inside Podman. The container IS the safety boundary:
+# opencode runs with every permission set to "allow" (opencode/opencode.json),
+# but only the single mounted project dir is visible, with whatever network the
+# invoker granted. No Node/npm in the image (only opencode's plugin SDK, below).
 #
-# Build:  podman build -t vibebox:latest -f vibebox/Containerfile vibebox
+# Build:  automatic (vibe builds/rebuilds it, labelled with a hash of this file
+#         + opencode/), or by hand: podman build -t vibebox:latest .
+# Also used (same image) for the allowlist proxy sidecar: `tinyproxy` below.
 
-FROM node:22-bookworm-slim
+FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         python3 python3-pip python3-venv \
-        ripgrep \
+        ripgrep fd-find tree file \
         build-essential \
-        ca-certificates curl less jq \
+        ca-certificates curl wget less jq \
+        unzip zip xz-utils patch \
+        procps sqlite3 nano openssh-client \
         tinyproxy \
+    && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
-# The agent itself, runnable in-container. Start it with
-#   claude --dangerously-skip-permissions
-# (safe here — the container is the boundary).
-RUN npm install -g @anthropic-ai/claude-code
+# uv: fast Python package/venv manager (pip on bookworm refuses system installs).
+COPY --from=ghcr.io/astral-sh/uv:0.9 /uv /uvx /usr/local/bin/
 
-# The container is ephemeral (--rm) and runs as uid 1000, which can't write the
-# root-owned npm prefix — so the in-box auto-updater only ever fails with a nag.
-# The image is the source of truth: update by rebuilding, not in place. Disable it.
-ENV DISABLE_AUTOUPDATER=1
+# opencode: standalone binary from the official GitHub release (Bun is bundled),
+# pinned. glibc build; the "baseline" variant for CPUs without AVX2, same rule as
+# the official install script (decided on the build host's CPU).
+ARG OPENCODE_VERSION=1.19.5
+RUN set -eu; \
+    case "$(uname -m)" in \
+        x86_64)  arch=x64; grep -qw avx2 /proc/cpuinfo || arch=x64-baseline ;; \
+        aarch64) arch=arm64 ;; \
+        *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/oc.tgz \
+        "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${arch}.tar.gz"; \
+    tar -xzf /tmp/oc.tgz -C /usr/local/bin opencode; \
+    chmod 755 /usr/local/bin/opencode; rm /tmp/oc.tgz; \
+    /usr/local/bin/opencode --version
 
-# Non-root: claude refuses --dangerously-skip-permissions as root, and uid 1000
-# pairs with `podman run --userns=keep-id` so files in /work stay host-owned.
-# The node base image already ships a uid-1000 user; drop it before reusing the id.
-RUN userdel -r node 2>/dev/null || true; useradd -m -u 1000 vibe
+# Python diagnostics without node: Astral's ty (Rust) as opencode's LSP. Tool env
+# lives outside $HOME so the uid-1000 user sees it; binary lands on PATH.
+ARG TY_VERSION=0.0.99
+RUN UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin \
+        uv tool install "ty==${TY_VERSION}" \
+    && rm -rf /root/.cache/uv \
+    && ty --version
 
-# Bake in agent skills (tdd, grill-me, codecard, grill-with-docs) and the
-# context status bar. Lives at ~/.claude so claude auto-discovers it; the
-# launcher mounts only the credential FILES so this dir is never shadowed.
-COPY claude-home/ /home/vibe/.claude/
-RUN chown -R 1000:1000 /home/vibe/.claude
+# Language servers are preinstalled (ty), so never try to download others.
+ENV OPENCODE_DISABLE_LSP_DOWNLOAD=true
+# No phoning home. opencode names verified in the 1.19.5 linux-x64 binary:
+# models.dev catalogue fetch, self-update, npm install of default auth plugins.
+ENV OPENCODE_DISABLE_MODELS_FETCH=true \
+    OPENCODE_DISABLE_AUTOUPDATE=true \
+    OPENCODE_DISABLE_DEFAULT_PLUGINS=true
+
+# LLM defaults for opencode.json's {env:...} placeholders (substituted as raw text
+# before JSON parse, so they work in the model key too). Harmless for llama.cpp;
+# the launcher overrides them (the API key by name only, never on argv).
+ENV LOCAL_LLM_MODEL=local \
+    LOCAL_LLM_API_KEY=local
+
+# Non-root uid 1000 pairs with `podman run --userns=keep-id` so files in /work
+# stay host-owned.
+RUN useradd -m -u 1000 vibe
+
+# opencode: global config (local OpenAI-compatible model, all permissions
+# allowed, ty LSP) + global AGENTS.md (work autonomously, no needless questions).
+COPY opencode/ /home/vibe/.config/opencode/
+RUN chown -R 1000:1000 /home/vibe/.config
 
 USER 1000:1000
 WORKDIR /work
 
-# Land in a shell by default; run `claude --dangerously-skip-permissions` to start the agent.
+# opencode installs @opencode-ai/plugin (its plugin SDK, pinned to its own
+# version) into every config dir on startup, from registry.npmjs.org. Do it once
+# here so runs don't try npm (the allowlist proxy would deny it). `debug wait`
+# loads the config, which starts that install; stop once it has landed.
+RUN set -eu; cd /tmp; dir=/home/vibe/.config/opencode; \
+    opencode debug wait >/dev/null 2>&1 & pid=$!; \
+    for i in $(seq 90); do \
+        [ -f "$dir/package-lock.json" ] && [ -f "$dir/node_modules/@opencode-ai/plugin/package.json" ] && break; \
+        sleep 1; \
+    done; sleep 2; kill $pid 2>/dev/null || true; \
+    test -f "$dir/node_modules/@opencode-ai/plugin/package.json"; \
+    rm -rf /home/vibe/.local/share/opencode /home/vibe/.local/state/opencode
+
+# The launcher picks the entry (opencode, or bash with `vibe -sh`).
 CMD ["bash"]
