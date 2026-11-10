@@ -15,9 +15,11 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+
+from trace_proxy import local_base_url
 
 # Real repo dir even when run through the ~/.local/bin/vibe symlink.
 REPO = os.path.dirname(os.path.realpath(__file__))
@@ -49,13 +51,20 @@ class Options:
     llm_model: str = ""       # model id -> LOCAL_LLM_MODEL (image default: "local")
     llm_key: bool = False     # pass LOCAL_LLM_API_KEY by NAME (value via env, not argv)
     oc_config: str = ""       # inline JSON -> OPENCODE_CONFIG_CONTENT (extra models)
+    trace_dir: str = ""       # host dir -> /trace; LLM calls go via the in-box trace proxy
+    ro: Optional[List[str]] = None  # None: /work rw | []: whole /work ro | [subdirs]: only those ro
 
 
 def build_podman_command(opts):
     cmd = [
         "podman", "run", "--rm",
         "-it" if opts.interactive else "-i",
-        "-v", f"{opts.work}:/work:rw",
+        "-v", f"{opts.work}:/work:{'ro' if opts.ro == [] else 'rw'}",
+    ]
+    # Read-only subfolders: a second bind mount on top of the rw /work.
+    for sub in opts.ro or []:
+        cmd += ["-v", f"{os.path.join(opts.work, sub)}:/work/{sub}:ro"]
+    cmd += [
         "-w", "/work",
         "--userns=keep-id",
     ] + HARDENING
@@ -66,7 +75,18 @@ def build_podman_command(opts):
     cmd += _limit_args(opts)
     if opts.gpu:
         cmd += ["--device", "nvidia.com/gpu=all"]
-    if opts.llm_url:
+    entry = ["opencode" if opts.opencode else "bash"]
+    if opts.trace_dir and opts.llm_url:
+        # opencode talks plain HTTP to the logging proxy on loopback; the proxy
+        # forwards to the real URL (through HTTPS_PROXY in allowlist mode).
+        cmd += ["-v", f"{opts.trace_dir}:{TRACE_MOUNT}:rw",
+                "-e", f"LOCAL_LLM_URL={local_base_url(opts.llm_url, TRACE_PORT)}",
+                "-e", f"TRACE_UPSTREAM={opts.llm_url}",
+                "-e", f"TRACE_DIR={TRACE_MOUNT}", "-e", f"TRACE_PORT={TRACE_PORT}"]
+        if "NO_PROXY=localhost,127.0.0.1" not in cmd:
+            cmd += ["-e", "NO_PROXY=localhost,127.0.0.1", "-e", "no_proxy=localhost,127.0.0.1"]
+        entry = ["python3", TRACE_PROXY_IN_BOX, "--exec"] + entry
+    elif opts.llm_url:
         cmd += ["-e", f"LOCAL_LLM_URL={opts.llm_url}"]
     if opts.llm_model:
         cmd += ["-e", f"LOCAL_LLM_MODEL={opts.llm_model}"]
@@ -76,8 +96,7 @@ def build_podman_command(opts):
         cmd += ["-e", "LOCAL_LLM_API_KEY"]
     if opts.oc_config:
         cmd += ["-e", f"OPENCODE_CONFIG_CONTENT={opts.oc_config}"]
-    cmd += [opts.image, "opencode" if opts.opencode else "bash"]
-    return cmd
+    return cmd + [opts.image] + entry
 
 
 LLM_KEYS = ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY")
@@ -209,6 +228,27 @@ def unsafe_workdir(path, home):
     return ""
 
 
+def resolve_ro(work, paths):
+    """-ro arguments -> (list for Options.ro, error). [] = the whole folder read-only.
+    Each path must be an existing directory INSIDE work (symlinks resolved, no ../ escapes)."""
+    if paths is None:
+        return None, ""
+    w = os.path.realpath(work)
+    subs = []
+    for raw in paths:
+        p = os.path.realpath(os.path.join(w, raw))
+        if p == w:
+            return [], ""                       # "-ro ." = everything read-only
+        if not p.startswith(w + os.sep):
+            return None, f"-ro {raw}: not inside {w}"
+        if not os.path.isdir(p):
+            return None, f"-ro {raw}: no such folder"
+        rel = os.path.relpath(p, w)
+        if rel not in subs:
+            subs.append(rel)
+    return subs, ""
+
+
 def install(bin_dir=None, name="vibe"):
     """Symlink <bin_dir>/vibe -> this script (real path). Idempotent."""
     bin_dir = bin_dir or os.path.join(os.path.expanduser("~"), ".local", "bin")
@@ -226,15 +266,16 @@ def install(bin_dir=None, name="vibe"):
 
 
 def image_hash(repo=None):
-    """Hash of everything baked into the image (Containerfile + opencode/)."""
+    """Hash of everything baked into the image (Containerfile, trace_proxy.py, opencode/)."""
     repo = repo or REPO
     h = hashlib.sha256()
-    files = ["Containerfile"] + sorted(
+    files = ["Containerfile", "trace_proxy.py"] + sorted(
         os.path.relpath(os.path.join(d, f), repo)
         for d, _, fs in os.walk(os.path.join(repo, "opencode")) for f in fs)
     for rel in files:
         h.update(rel.replace(os.sep, "/").encode() + b"\0")
-        h.update(Path(repo, rel).read_bytes() + b"\0")
+        f = Path(repo, rel)
+        h.update((f.read_bytes() if f.exists() else b"") + b"\0")
     return h.hexdigest()[:16]
 
 
@@ -315,6 +356,20 @@ def new_egress_log():
     return path
 
 
+def project_name(work):
+    return os.path.basename(os.path.normpath(work)) or "project"
+
+
+def new_trace_dir(project):
+    """Fresh per-launch host dir the in-box trace proxy writes into (0700; the box
+    runs as the host uid via keep-id, so no world-writable perms needed)."""
+    os.makedirs(TRACE_ROOT, mode=0o700, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", project) or "project"
+    path = os.path.join(TRACE_ROOT, f"{safe}-{time.strftime('%Y%m%d-%H%M%S')}")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
 def latest_egress_log():
     try:
         logs = sorted(f for f in os.listdir(LOG_DIR) if f.startswith("egress-"))
@@ -360,6 +415,9 @@ def main(argv=None):
     p.add_argument("-net", nargs="+", default=None,
                    help="full | none | space/comma list of hosts/keywords (default: full; "
                         "with an LLM URL: only the LLM host)")
+    p.add_argument("-ro", nargs="*", default=None, metavar="SUBDIR",
+                   help="read-only: '-ro' alone = whole folder; '-ro docs data' = only "
+                        "those subfolders, the rest stays writable")
     p.add_argument("-gpu", action="store_true")
     p.add_argument("-ram", default="")
     p.add_argument("-cpu", type=int, default=0)
@@ -376,7 +434,17 @@ def main(argv=None):
     p.add_argument("-stop-proxy", dest="stop_proxy", action="store_true")
     p.add_argument("-log", action="store_true",
                    help="print the most recent egress log (allowlist mode) and exit")
+    p.add_argument("-trace", action="store_true",
+                   help=f"log every LLM request/response to {TRACE_ROOT}/<project>-<time>/ "
+                        "(learn what the harness sends the model)")
+    p.add_argument("-trace-show", dest="trace_show", nargs="*", default=None,
+                   metavar="DIR|N", help="summarise the latest (or given) trace; "
+                                         "N = that call in full")
     args = p.parse_args(argv)
+
+    if args.trace_show is not None:
+        import trace_proxy
+        return trace_proxy.show(args.trace_show, TRACE_ROOT)
 
     if args.install:
         try:
@@ -419,6 +487,11 @@ def main(argv=None):
               "cd into a project directory first", file=sys.stderr)
         return 2
 
+    ro, err = resolve_ro(work, args.ro)
+    if err:
+        print(f"vibebox: {err}", file=sys.stderr)
+        return 2
+
     cfg = resolve_llm({"LOCAL_LLM_URL": args.llm, "LOCAL_LLM_MODEL": args.model},
                       os.environ, load_llm_env(LLM_ENV))
     args.llm, model, key = cfg["LOCAL_LLM_URL"], cfg["LOCAL_LLM_MODEL"], cfg["LOCAL_LLM_API_KEY"]
@@ -445,6 +518,12 @@ def main(argv=None):
         print("vibebox: image build failed", file=sys.stderr)
         return 1
     oc_config, n_models = model_config(args.llm, model, key) if args.llm else ("", 0)
+    trace_dir = ""
+    if args.trace:
+        if not args.llm:
+            print("vibebox: -trace needs an LLM URL (-llm or llm.env)", file=sys.stderr)
+            return 2
+        trace_dir = new_trace_dir(project_name(work))
     log_file = ""
     if "none" not in tokens and "full" not in tokens:  # allow-list mode
         if llm_host and llm.scheme == "https" and llm.port not in (None, 443):
@@ -454,19 +533,23 @@ def main(argv=None):
         setup_allow_proxy(domains, args.image, log_file)
 
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
-    project = os.path.basename(work)
+    project = project_name(work)
     host = re.sub(r"[^A-Za-z0-9-]", "-", project).strip("-") or "devbox"
     opts = Options(work=work, image=args.image, net=net, ram=args.ram,
                    cpu=args.cpu, disk=args.disk, gpu=args.gpu, interactive=interactive,
                    hostname=host, opencode=opencode, llm_url=args.llm,
-                   llm_model=model, llm_key=bool(key), oc_config=oc_config)
+                   llm_model=model, llm_key=bool(key), oc_config=oc_config,
+                   trace_dir=trace_dir, ro=ro)
     cmd = build_podman_command(opts)
     res = machine_resources()
     entry = "opencode" if opencode else "shell (run 'opencode')"
     models = f" (+{n_models - 1} more: /models)" if n_models > 1 else ""
     print(f"vibe: {entry} | model={model or 'local'}{models} | net={net_mode(net)}")
-    print(f"      {work} -> /work{' | gpu' if args.gpu else ''}{' | ' + res if res else ''}"
-          f"{' | log: ' + log_file if log_file else ''}")
+    ro_note = "" if ro is None else (" (READ-ONLY)" if ro == [] else
+                                     " (read-only: " + ", ".join(ro) + ")")
+    print(f"      {work} -> /work{ro_note}{' | gpu' if args.gpu else ''}{' | ' + res if res else ''}"
+          f"{' | log: ' + log_file if log_file else ''}"
+          f"{' | trace: ' + trace_dir if trace_dir else ''}")
     env = dict(os.environ, LOCAL_LLM_API_KEY=key) if key else None
     herdr = opencode and os.environ.get("HERDR_ENV") == "1"
     if herdr:
@@ -496,6 +579,9 @@ def main(argv=None):
         if log_file and os.path.exists(log_file):
             text = Path(log_file).read_text(encoding="utf-8", errors="replace")
             print(f"vibebox: {egress_summary(text)}  [{log_file}]")
+        if trace_dir:
+            n = len([f for f in os.listdir(trace_dir) if f.endswith("-http.json")])
+            print(f"vibebox: trace: {n} LLM call(s) in {trace_dir}  (view: vibe -trace-show)")
 
 
 def _limit_args(opts):
@@ -520,6 +606,10 @@ PROXY_IP = "10.213.0.250"
 INTERNAL_NET_ARGS = ["--internal", "--disable-dns", "--subnet", INTERNAL_SUBNET]
 LOG_DIR = os.path.join(os.path.expanduser("~"), ".vibebox", "logs")
 LLM_ENV = os.path.join(os.path.expanduser("~"), ".vibebox", "llm.env")
+TRACE_ROOT = os.path.join(os.path.expanduser("~"), ".vibebox", "traces")
+TRACE_MOUNT = "/trace"
+TRACE_PORT = 4141
+TRACE_PROXY_IN_BOX = "/usr/local/lib/vibebox/trace_proxy.py"  # see Containerfile
 PROXY_LOG = "/var/log/vibebox/egress.log"  # must match LogFile in tinyproxy.conf
 
 # Single source of truth for hardening — shared by the sandbox and the proxy.

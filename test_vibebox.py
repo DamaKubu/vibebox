@@ -565,3 +565,228 @@ def test_herdr_hint_and_metadata_only_inside_herdr(monkeypatch, tmp_path):
     assert a[:3] == ["pane", "report-metadata", "w1:p2"]
     title = a[a.index("--title") + 1]
     assert "m1" in title and "h" in title and os.path.basename(os.getcwd()) in title
+
+
+# --- Trace mode (vibe -trace / -trace-show) --------------------------------
+
+import json as _json
+import trace_proxy
+
+SSE = "\n\n".join("data: " + _json.dumps(e) for e in [
+    {"id": "c1", "model": "qwen", "choices": [{"index": 0, "delta": {"role": "assistant",
+                                                                     "content": "Let me "}}]},
+    {"id": "c1", "choices": [{"index": 0, "delta": {"content": "check."}}]},
+    {"id": "c1", "choices": [{"index": 0, "delta": {"tool_calls": [
+        {"index": 0, "id": "call_a", "type": "function",
+         "function": {"name": "bash", "arguments": ""}}]}}]},
+    {"id": "c1", "choices": [{"index": 0, "delta": {"tool_calls": [
+        {"index": 0, "function": {"arguments": '{"command": "py'}}]}}]},
+    {"id": "c1", "choices": [{"index": 0, "delta": {"tool_calls": [
+        {"index": 0, "function": {"arguments": 'thon3 -V"}'}},
+        {"index": 1, "id": "call_b", "function": {"name": "read", "arguments": '{"path":"a"}'}}]}}]},
+    {"id": "c1", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+    {"id": "c1", "choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5,
+                                          "total_tokens": 15}},
+]) + "\n\ndata: [DONE]\n\n"
+
+
+def test_trace_assembles_text_tool_calls_finish_and_usage_from_chunks():
+    r = trace_proxy.assemble_sse(SSE)
+    m = r["message"]
+    assert m["content"] == "Let me check." and r["model"] == "qwen"
+    assert [c["id"] for c in m["tool_calls"]] == ["call_a", "call_b"]
+    assert m["tool_calls"][0]["function"] == {"name": "bash",
+                                              "arguments": '{"command": "python3 -V"}'}
+    assert m["tool_calls"][0]["arguments_parsed"] == {"command": "python3 -V"}
+    assert m["tool_calls"][1]["arguments_parsed"] == {"path": "a"}
+    assert r["finish_reason"] == "tool_calls" and r["usage"]["total_tokens"] == 15
+
+
+def test_trace_assembly_keeps_bad_json_args_raw_and_plain_answers():
+    bad = 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"x","function":' \
+          '{"name":"f","arguments":"{oops"}}]},"finish_reason":"tool_calls"}]}\n'
+    tc = trace_proxy.assemble_sse(bad)["message"]["tool_calls"][0]
+    assert tc["function"]["arguments"] == "{oops" and tc["arguments_parsed"] is None
+    ok = trace_proxy.assemble_sse('data: {"choices":[{"delta":{"content":"hi"},'
+                                  '"finish_reason":"stop"}]}\ndata: [DONE]\n')
+    assert ok["message"] == {"role": "assistant", "content": "hi"}
+    assert ok["finish_reason"] == "stop"
+
+
+def test_trace_redacts_auth_headers_but_keeps_others():
+    h = trace_proxy.redact_headers({"Authorization": "Bearer s3cr3t-key", "x-api-key": "k2",
+                                    "Content-Type": "application/json"})
+    assert "s3cr3t-key" not in str(h) and "k2" not in str(h)
+    assert h["Authorization"] == "Bearer <redacted>"
+    assert h["Content-Type"] == "application/json"
+
+
+def test_trace_url_mapping_keeps_upstream_path():
+    up = "https://api.scaleway.ai/v1"
+    assert trace_proxy.local_base_url(up, 4141) == "http://127.0.0.1:4141/v1"
+    assert trace_proxy.upstream_url(up, "/v1/chat/completions") == \
+        "https://api.scaleway.ai/v1/chat/completions"
+
+
+def test_trace_launcher_wiring(monkeypatch, tmp_path, capsys):
+    import vibebox
+    ran, _ = _fake_host(monkeypatch, tmp_path)
+    monkeypatch.setattr(vibebox, "TRACE_ROOT", str(tmp_path / "traces"))
+    vibebox.main(["-trace", "-llm", "https://api.scaleway.ai/v1"])
+    c = ran[-1]
+    mounts = [c[i + 1] for i, a in enumerate(c) if a == "-v"]
+    trace = [m for m in mounts if m.endswith(":/trace:rw")]
+    assert len(trace) == 1 and trace[0].startswith(str(tmp_path / "traces"))
+    host_dir = trace[0].rsplit(":/trace", 1)[0]
+    assert os.path.isdir(host_dir) and stat.S_IMODE(os.stat(host_dir).st_mode) == 0o700
+    assert "/work" not in host_dir and "LOCAL_LLM_URL=http://127.0.0.1:4141/v1" in c
+    assert "TRACE_UPSTREAM=https://api.scaleway.ai/v1" in c
+    assert "LOCAL_LLM_URL=https://api.scaleway.ai/v1" not in c
+    assert "NO_PROXY=localhost,127.0.0.1" in c and "no_proxy=localhost,127.0.0.1" in c
+    assert c[-4:] == ["python3", vibebox.TRACE_PROXY_IN_BOX, "--exec", "opencode"]
+    assert any(a.startswith("HTTPS_PROXY=") for a in c)     # still locked down
+    out = capsys.readouterr().out
+    banner = [l for l in out.splitlines() if not l.startswith("vibebox:")]
+    assert len(banner) == 2 and "trace: " + host_dir in banner[1]   # 2-line banner
+    assert "vibe -trace-show" in out                                   # exit hint
+    # without -trace: nothing of it
+    vibebox.main(["-llm", "https://api.scaleway.ai/v1"])
+    assert not any("TRACE_" in a or ":/trace" in a for a in ran[-1])
+    assert ran[-1][-1] == "opencode"
+
+
+def test_trace_with_full_net_still_bypasses_proxy_for_loopback(monkeypatch, tmp_path):
+    import vibebox
+    ran, _ = _fake_host(monkeypatch, tmp_path)
+    monkeypatch.setattr(vibebox, "TRACE_ROOT", str(tmp_path / "traces"))
+    vibebox.main(["-trace", "-sh", "-net", "full", "-llm", "http://h:8080/v1"])
+    assert "no_proxy=localhost,127.0.0.1" in ran[-1] and ran[-1][-1] == "bash"
+
+
+def test_trace_needs_llm(monkeypatch, tmp_path):
+    import vibebox
+    _fake_host(monkeypatch, tmp_path)
+    assert vibebox.main(["-trace"]) == 2
+
+
+def test_image_hash_tracks_trace_proxy(tmp_path):
+    from vibebox import image_hash
+    (tmp_path / "opencode").mkdir()
+    (tmp_path / "Containerfile").write_text("FROM x\n")
+    h = image_hash(str(tmp_path))
+    (tmp_path / "trace_proxy.py").write_text("# v2\n")
+    assert image_hash(str(tmp_path)) != h
+
+
+def test_trace_show_renders_the_agent_loop(tmp_path, capsys):
+    d = tmp_path / "proj-1"
+    d.mkdir()
+    tools = [{"type": "function", "function": {"name": "bash", "description": "Run a command\nmore",
+                                               "parameters": {"type": "object"}}}]
+    m1 = [{"role": "system", "content": "You are opencode.\nBe brief."},
+          {"role": "user", "content": "print 2+3"}]
+    asst = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call_a", "type": "function",
+         "function": {"name": "bash", "arguments": '{"command":"python3 -c \\"print(2+3)\\""}'}}]}
+    m2 = m1 + [asst, {"role": "tool", "tool_call_id": "call_a", "content": "5\n"}]
+    def write(n, req, resp):
+        (d / f"{n}-http.json").write_text(_json.dumps(
+            {"method": "POST", "path": "/v1/chat/completions", "status": 200, "seconds": 1}))
+        (d / f"{n}-request.json").write_text(_json.dumps(req))
+        (d / f"{n}-response.json").write_text(_json.dumps(resp))
+    write("001", {"model": "q", "messages": m1, "tools": tools},
+          trace_proxy.assemble_sse(SSE))
+    write("002", {"model": "q", "messages": m2, "tools": tools},
+          {"message": {"role": "assistant", "content": "It prints 5."}, "finish_reason": "stop"})
+    assert trace_proxy.show([], str(tmp_path), color=False) == 0
+    out = capsys.readouterr().out
+    assert "SYSTEM PROMPT" in out and "You are opencode." in out
+    assert out.count("TOOLS offered") == 1 and "tools: same as before" in out
+    assert "tool_call bash" in out and "tool result" in out and "5" in out
+    assert "finish_reason=tool_calls" in out and "finish_reason=stop" in out
+    assert "loop stops here" in out
+    # call 002 shows only the 2 new messages (assistant tool_call + tool result)
+    assert "NEW MESSAGES since call with 2 msgs (2)" in out
+    assert trace_proxy.show([str(d), "2"], str(tmp_path), color=False) == 0
+    one = capsys.readouterr().out
+    assert "call 002" in one and "call 001" not in one and '"type": "object"' in one
+
+
+def test_trace_proxy_streams_and_logs_end_to_end(tmp_path):
+    """Real sockets: fake SSE upstream <- trace proxy <- client; chunks arrive
+    before the upstream finishes, files are written, auth is redacted."""
+    import threading, time, urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    gate = threading.Event()
+
+    class Up(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            assert self.headers["Authorization"] == "Bearer s3cr3t-key"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n')
+            self.wfile.flush()
+            gate.wait(5)   # hold the stream open until the client saw chunk 1
+            self.wfile.write(b'data: {"choices":[{"delta":{"content":"b"},'
+                             b'"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+    up = ThreadingHTTPServer(("127.0.0.1", 0), Up)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    srv = trace_proxy.serve(f"http://127.0.0.1:{up.server_port}/v1", str(tmp_path), 0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{srv.server_port}/v1/chat/completions",
+            data=b'{"model":"m","messages":[],"stream":true}',
+            headers={"Authorization": "Bearer s3cr3t-key", "Content-Type": "application/json"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=10) as r:
+            first = r.read1(4096)
+            assert b'"a"' in first            # streamed before upstream finished
+            gate.set()
+            rest = r.read()
+        assert b"[DONE]" in rest
+        for _ in range(50):
+            if (tmp_path / "001-http.json").exists():
+                break
+            time.sleep(0.05)
+        final = _json.loads((tmp_path / "001-response.json").read_text())
+        assert final["message"]["content"] == "ab" and final["finish_reason"] == "stop"
+        assert (tmp_path / "001-response.sse").read_bytes().count(b"data:") == 3
+        assert _json.loads((tmp_path / "001-request.json").read_text())["stream"] is True
+        logged = "".join(p.read_text() for p in tmp_path.iterdir())
+        assert "s3cr3t-key" not in logged and "<redacted>" in logged
+    finally:
+        gate.set()
+        srv.shutdown()
+        up.shutdown()
+
+
+# --- Read-only mounts (-ro) ---------------------------------------------------
+
+def test_ro_whole_folder():
+    assert mounts_of(cmd(ro=[])) == ["/home/me/proj:/work:ro"]
+
+
+def test_ro_subfolders_on_top_of_rw_work():
+    assert mounts_of(cmd(ro=["docs", "data/raw"])) == [
+        "/home/me/proj:/work:rw",
+        "/home/me/proj/docs:/work/docs:ro",
+        "/home/me/proj/data/raw:/work/data/raw:ro"]
+
+
+def test_resolve_ro(tmp_path):
+    from vibebox import resolve_ro
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "data" / "raw").mkdir(parents=True)
+    (tmp_path / "file.txt").write_text("x")
+    (tmp_path / "sneaky").symlink_to("/etc")
+    assert resolve_ro(tmp_path, None) == (None, "")            # flag not given
+    assert resolve_ro(tmp_path, []) == ([], "")                # -ro alone: everything
+    assert resolve_ro(tmp_path, ["."]) == ([], "")
+    assert resolve_ro(tmp_path, ["docs", "./data/raw/", "docs"]) == (["docs", "data/raw"], "")
+    for bad in (["../"], ["/etc"], ["sneaky"], ["missing"], ["file.txt"]):
+        subs, err = resolve_ro(tmp_path, bad)
+        assert subs is None and err, bad

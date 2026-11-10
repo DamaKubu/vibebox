@@ -5,7 +5,9 @@
   "permission": {
     "edit": "allow",
     "bash": "allow",
-    "webfetch": "allow"
+    "webfetch": "deny",
+    "external_directory": "allow",
+    "doom_loop": "deny"
   },
   "lsp": {
     "pyright": {
@@ -36,10 +38,21 @@
       "models": {
         "{env:LOCAL_LLM_MODEL}": {
           "name": "{env:LOCAL_LLM_MODEL}",
-          "limit": { "context": 100000, "output": 8192 }
+          "limit": {
+            "context": 100000,
+            "output": 8192
+          }
         }
       }
     }
   },
-  "model": "local/{env:LOCAL_LLM_MODEL}"
+  "model": "local/{env:LOCAL_LLM_MODEL}",
+  "agent": {
+    "build": {
+      "prompt": "{file:./prompts/vibe.md}",
+      "tools": {
+        "webfetch": false
+      }
+    }
+  }
 }

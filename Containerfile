@@ -88,5 +88,10 @@ RUN set -eu; cd /tmp; dir=/home/vibe/.config/opencode; \
     test -f "$dir/node_modules/@opencode-ai/plugin/package.json"; \
     rm -rf /home/vibe/.local/share/opencode /home/vibe/.local/state/opencode
 
+# Trace mode (`vibe -trace`): a stdlib logging reverse proxy the launcher starts
+# in front of opencode (trace_proxy.py --exec opencode). Last, so editing it
+# only rebuilds this layer.
+COPY trace_proxy.py /usr/local/lib/vibebox/trace_proxy.py
+
 # The launcher picks the entry (opencode, or bash with `vibe -sh`).
 CMD ["bash"]

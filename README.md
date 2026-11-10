@@ -87,8 +87,8 @@ then `wsl --shutdown` and `podman machine stop; podman machine start`.
 
 ## Image build
 Automatic: `vibe` builds `vibebox:latest` on first use and rebuilds it whenever
-the `Containerfile` or `opencode/` changes (it labels the image with a hash of
-both). By hand: `podman build -t vibebox:latest .`
+the `Containerfile`, `trace_proxy.py` or `opencode/` changes (it labels the image
+with a hash of them). By hand: `podman build -t vibebox:latest .`
 The image is `debian:bookworm-slim` + apt dev tools + uv + the standalone opencode
 binary (pinned, Bun bundled) + `ty` for Python diagnostics. **No Node/npm.**
 opencode installs its plugin SDK (`@opencode-ai/plugin`) into its config dir on
@@ -109,8 +109,34 @@ vibe                                                # opencode, only the LLM hos
 vibe -sh                                            # bash shell (run `opencode` inside)
 vibe -llm http://100.x.y.z:8080/v1 -net pypi -ram 5GB   # other LLM, + pypi, limits
 vibe -sh -net none                                  # air-gapped shell (no LLM)
+vibe -ro                                            # whole folder read-only (review, explain)
+vibe -ro docs data/raw                              # only these subfolders read-only, rest writable
 ```
 Other flags: `-model ID`, `-gpu`, `-cpu N`, `-disk 10GB`, `-log`, `-stop-proxy`, `-clean`.
+
+### Trace mode (learn how the agent works)
+`vibe -trace` records every call opencode makes to the model; `vibe -trace-show`
+explains them. You see the system prompt, the tools array (JSON schemas), the
+messages, the model's `tool_calls`, the tool results sent back and the streamed
+chunks. That is the whole agent loop: **the model asks for a tool, the harness
+runs it, the result goes back as a `tool` message, repeat until the model answers
+without tool calls.**
+```bash
+vibe -trace                       # banner shows: trace: ~/.vibebox/traces/<project>-<time>
+vibe -trace-show                  # summary of the latest trace, one block per call
+vibe -trace-show 3                # call 3 in full: whole prompt, schemas, messages
+vibe -trace-show <dir> [N]        # an older trace
+```
+How: the image carries `trace_proxy.py` (stdlib only). With `-trace` it starts in
+the box on `127.0.0.1:4141` before opencode, opencode's `LOCAL_LLM_URL` points at it,
+and it forwards each request to the real URL (`TRACE_UPSTREAM`) through the usual
+egress proxy. Streams pass through chunk by chunk. The egress log still shows only
+the LLM host. Per call `NNN` in the trace dir (mounted at `/trace`, not in `/work`):
+`NNN-request.json` (request body), `NNN-response.sse` (raw stream),
+`NNN-response.json` (assembled reply: text, tool calls with parsed args,
+`finish_reason`, usage) and `NNN-http.json` (status, timing, headers with the
+`Authorization` value redacted). Traces contain your prompts and code; delete them
+when you're done. The box can write to its trace dir.
 
 ### herdr
 Inside a [herdr](https://herdr.dev) pane, `vibe` marks the pane as an opencode
