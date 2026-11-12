@@ -49,10 +49,54 @@
   "model": "local/{env:LOCAL_LLM_MODEL}",
   "agent": {
     "build": {
+      "description": "agent: full coding agent (read, edit, run)",
       "prompt": "{file:./prompts/vibe.md}",
       "tools": {
         "webfetch": false
       }
+    },
+    "write": {
+      "mode": "primary",
+      "description": "write: creates files, can't read or run anything",
+      "prompt": "{file:./prompts/write.md}",
+      "tools": {
+        "read": false,
+        "grep": false,
+        "glob": false,
+        "list": false,
+        "bash": false,
+        "task": false,
+        "skill": false,
+        "todowrite": false,
+        "todoread": false,
+        "webfetch": false,
+        "patch": false,
+        "write": true,
+        "edit": true
+      }
+    },
+    "chat": {
+      "mode": "primary",
+      "description": "chat: just talk, no tools, can't touch any file",
+      "prompt": "{file:./prompts/chat.md}",
+      "tools": {
+        "read": false,
+        "grep": false,
+        "glob": false,
+        "list": false,
+        "bash": false,
+        "task": false,
+        "skill": false,
+        "todowrite": false,
+        "todoread": false,
+        "webfetch": false,
+        "patch": false,
+        "write": false,
+        "edit": false
+      }
+    },
+    "plan": {
+      "disable": true
     }
   }
 }

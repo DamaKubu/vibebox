@@ -120,13 +120,11 @@ def test_entry_shell_default_and_opencode_switch():
     assert cmd(opencode=True)[-1] == "opencode"
 
 
-def test_claude_is_gone():
-    assert "claude" not in expand_allowlist(["claude"])[0] and \
-        expand_allowlist(["claude"])[1] == ["claude"]   # no longer a preset
+def test_claude_not_a_net_preset_and_creds_flag_gone():
+    assert "claude" not in expand_allowlist(["claude"])[0]
     import vibebox
-    for flag in ("-claude", "-creds"):
-        with pytest.raises(SystemExit):
-            vibebox.main([flag])
+    with pytest.raises(SystemExit):
+        vibebox.main(["-creds"])
 
 
 # --- Cycle 9: mounts (security: only the project dir is mounted) ------------
@@ -252,12 +250,15 @@ def _fake_host(monkeypatch, tmp_path):
     seen, ran = {}, []
     monkeypatch.setattr(vibebox, "LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setattr(vibebox, "setup_allow_proxy",
-                        lambda domains, image, log_file: seen.update(domains=list(domains),
-                                                                     log=log_file))
+                        lambda domains, image, log_file: (seen.update(domains=list(domains),
+                                                                      log=log_file),
+                                                          ("vibebox-proxy-200", "10.213.0.200"))[1])
     monkeypatch.setattr(vibebox, "machine_resources", lambda: "")
     monkeypatch.setattr(vibebox, "ensure_image", lambda image: 0)
     monkeypatch.setattr(vibebox, "fetch_models", lambda url, key: [])
     def fake_run(c, **kw):
+        if c[:3] == ["podman", "rm", "-f"]:      # session-proxy cleanup, not the box
+            return type("R", (), {"returncode": 0})()
         ran.append(c)
         ran_env.append(kw.get("env"))
         return type("R", (), {"returncode": 0})()
@@ -790,3 +791,132 @@ def test_resolve_ro(tmp_path):
     for bad in (["../"], ["/etc"], ["sneaky"], ["missing"], ["file.txt"]):
         subs, err = resolve_ro(tmp_path, bad)
         assert subs is None and err, bad
+
+
+# --- ChatGPT subscription (-openai) -------------------------------------------
+
+def test_openai_login_dir_and_plugins_only_when_asked():
+    plain = cmd()
+    assert not any("OPENCODE_DISABLE_DEFAULT_PLUGINS" in a for a in plain)
+    c = cmd(openai_login="/home/me/.vibebox/login/openai")
+    assert "/home/me/.vibebox/login/openai:/home/vibe/.local/share/opencode:rw" in mounts_of(c)
+    assert "OPENCODE_DISABLE_DEFAULT_PLUGINS=false" in c
+
+
+def test_openai_hosts_join_the_allowlist():
+    from vibebox import OPENAI_HOSTS
+    net, domains, _ = resolve_net(None, True, "api.scaleway.ai", OPENAI_HOSTS)
+    assert domains == ["api.scaleway.ai", "auth.openai.com", "chatgpt.com"]
+    net, domains, _ = resolve_net(None, True, "", OPENAI_HOSTS)      # no other LLM
+    assert domains == ["auth.openai.com", "chatgpt.com"]
+    net, domains, _ = resolve_net(["pypi"], True, "", OPENAI_HOSTS)  # explicit allowlist
+    assert "chatgpt.com" in domains and "auth.openai.com" in domains
+    net, _, _ = resolve_net(["full"], True, "", OPENAI_HOSTS)        # full stays full
+    assert net == ["full"]
+
+
+# --- Claude Code with the user's subscription (-claude) ------------------------
+
+def test_claude_entry_login_dir_and_no_llm_key():
+    c = cmd(claude=True, claude_login="/home/me/.vibebox/login/claude")
+    assert c[-2:] == ["claude", "--dangerously-skip-permissions"]
+    assert "/home/me/.vibebox/login/claude:/home/vibe/.claude-login:rw" in mounts_of(c)
+    assert "CLAUDE_CONFIG_DIR=/home/vibe/.claude-login" in c
+    assert "LOCAL_LLM_API_KEY" not in c
+    assert not any("claude" in a for a in cmd())          # nothing Claude by default
+
+
+def test_claude_allowlist_is_anthropic_only():
+    from vibebox import CLAUDE_HOSTS
+    net, domains, _ = resolve_net(None, False, "", CLAUDE_HOSTS)
+    assert domains == ["api.anthropic.com", "claude.ai", "claude.com", "platform.claude.com"]
+
+
+def test_claude_refuses_mixing(monkeypatch, tmp_path):
+    import vibebox
+    monkeypatch.chdir(tmp_path)
+    for extra in (["-openai"], ["-trace"], ["-llm", "http://x:1/v1"]):
+        assert vibebox.main(["-claude"] + extra) == 2
+
+
+# --- One proxy per session -----------------------------------------------------
+
+def test_box_uses_its_own_session_proxy():
+    c = cmd(net=["api.scaleway.ai"], proxy_ip="10.213.0.201")
+    assert "HTTPS_PROXY=http://10.213.0.201:8080" in c
+    assert "vibebox-proxy:10.213.0.201" in c
+
+
+def test_session_proxy_command_has_own_name_and_ip():
+    c = build_proxy_command("vibebox:latest", "/a", "/c", "/l", "vibebox-proxy-201", "10.213.0.201")
+    assert c[c.index("--name") + 1] == "vibebox-proxy-201"
+    assert "vibe-internal:ip=10.213.0.201" in c
+
+
+def test_claude_settings_get_statusline_and_keep_others(tmp_path):
+    import json as _j
+    from vibebox import ensure_claude_settings, BOX_STATUSLINE
+    (tmp_path / "settings.json").write_text('{"theme": "dark"}')
+    ensure_claude_settings(str(tmp_path))
+    cfg = _j.loads((tmp_path / "settings.json").read_text())
+    assert cfg == {"theme": "dark", "statusLine": {"type": "command", "command": BOX_STATUSLINE}}
+
+
+# --- -out: only a fresh empty folder is mounted --------------------------------
+
+def test_out_mounts_only_vibe_out(monkeypatch, tmp_path):
+    import vibebox
+    (tmp_path / "secret.txt").write_text("x")
+    monkeypatch.chdir(tmp_path)
+    ran = []
+    monkeypatch.setattr(vibebox, "ensure_image", lambda image: 0)
+    monkeypatch.setattr(vibebox, "machine_resources", lambda: "")
+    monkeypatch.setattr(vibebox.subprocess, "run",
+                        lambda c, **kw: (ran.append(c), type("R", (), {"returncode": 0})())[1])
+    assert vibebox.main(["-out", "-sh", "-net", "none"]) == 0
+    box = [c for c in ran if c[:2] == ["podman", "run"]][-1]
+    assert mounts_of(box) == [f"{tmp_path}/vibe-out:/work:rw"]
+    assert (tmp_path / "vibe-out").is_dir()
+    assert vibebox.main(["-out", "-ro"]) == 2
+
+
+def test_modes_in_opencode_config():
+    import json as _j
+    cfg = _j.load(open(os.path.join(os.path.dirname(__file__), "opencode", "opencode.json")))
+    a = cfg["agent"]
+    assert a["plan"] == {"disable": True}
+    assert not any(a["chat"]["tools"].values())                      # chat: no tools at all
+    allowed = {k for k, v in a["write"]["tools"].items() if v}
+    assert allowed == {"write", "edit"}                               # write: blind writer
+
+
+# --- -setup-claude: same Claude Code security setup on any laptop -------------
+
+def test_merge_settings_only_adds():
+    from vibebox import merge_settings
+    cur = {"theme": "dark", "permissions": {"deny": ["Read(~/.ssh/**)", "Read(~/mine)"]},
+           "sandbox": {"enabled": False}}
+    extra = {"permissions": {"deny": ["Read(~/.ssh/**)", "Read(~/.aws/**)"], "ask": ["Bash(git push:*)"]},
+             "sandbox": {"enabled": True}}
+    m = merge_settings(cur, extra)
+    assert m["theme"] == "dark"
+    assert m["permissions"]["deny"] == ["Read(~/.ssh/**)", "Read(~/mine)", "Read(~/.aws/**)"]
+    assert m["permissions"]["ask"] == ["Bash(git push:*)"]
+    assert m["sandbox"]["enabled"] is True
+
+
+def test_setup_claude_on_fresh_and_existing(tmp_path):
+    import json as _j
+    from vibebox import setup_claude
+    d = tmp_path / ".claude"
+    f = setup_claude(str(d))                                    # fresh laptop
+    cfg = _j.loads(open(f).read())
+    assert cfg["sandbox"]["enabled"] is True
+    assert "Bash(dangerouslyDisableSandbox:true)" in cfg["permissions"]["ask"]
+    assert cfg["statusLine"]["command"] == str(d / "statusline-command.sh")
+    assert os.access(d / "statusline-command.sh", os.X_OK)
+    (d / "settings.json").write_text('{"theme": "light", "permissions": {"deny": ["Read(~/x)"]}}')
+    setup_claude(str(d))                                        # existing settings kept
+    cfg = _j.loads((d / "settings.json").read_text())
+    assert cfg["theme"] == "light" and "Read(~/x)" in cfg["permissions"]["deny"]
+    assert (d / "settings.json.bak").exists()

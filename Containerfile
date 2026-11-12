@@ -41,6 +41,30 @@ RUN set -eu; \
     chmod 755 /usr/local/bin/opencode; rm /tmp/oc.tgz; \
     /usr/local/bin/opencode --version
 
+# Claude Code (vibe -claude): Anthropic's official native binary, no node. Pinned
+# version AND pinned SHA256 (x64), so a tampered download server can't swap it.
+# The login is NOT in the image: vibe mounts ~/.vibebox/login/claude at run time.
+ARG CLAUDE_VERSION=2.1.311
+ARG CLAUDE_SHA256_X64=86dc1fcc69498159eaf15f446613e847010f9036bfbbdffd4c49350be8489ada
+RUN set -eu; \
+    base="https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}"; \
+    case "$(uname -m)" in \
+        x86_64)  p=linux-x64; sum="${CLAUDE_SHA256_X64}" ;; \
+        aarch64) p=linux-arm64; sum=$(curl -fsSL "$base/manifest.json" | jq -r ".platforms[\"$p\"].checksum") ;; \
+        *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/local/bin/claude "$base/$p/claude"; \
+    echo "$sum  /usr/local/bin/claude" | sha256sum -c -; \
+    chmod 755 /usr/local/bin/claude
+# Status line for Claude Code in the box (ctx %, tokens, net, subagents).
+COPY box/statusline.sh /usr/local/lib/vibebox/statusline.sh
+RUN chmod 755 /usr/local/lib/vibebox/statusline.sh
+# No self-update, no telemetry, no error reports. (Not the big
+# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC switch: it also kills Remote Control.)
+ENV DISABLE_UPDATES=1 \
+    DISABLE_TELEMETRY=1 \
+    DISABLE_ERROR_REPORTING=1
+
 # Python diagnostics without node: Astral's ty (Rust) as opencode's LSP. Tool env
 # lives outside $HOME so the uid-1000 user sees it; binary lands on PATH.
 ARG TY_VERSION=0.0.99

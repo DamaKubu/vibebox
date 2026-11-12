@@ -1,0 +1,46 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.config/gcloud/**)",
+      "Read(~/.kube/**)",
+      "Read(~/.docker/**)",
+      "Read(~/.vibebox/login/**)",
+      "Read(~/.vibebox/llm.env)",
+      "Read(~/.local/share/opencode/**)",
+      "Read(~/projects_linux/no-sniff/**)"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(dangerouslyDisableSandbox:true)",
+      "Edit(**/.claude/settings*.json)",
+      "Edit(~/.claude/CLAUDE.md)",
+      "Edit(~/.claude/settings*.json)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "allowUnsandboxedCommands": true,
+    "network": {
+      "allowedDomains": [
+        "api.scaleway.ai"
+      ]
+    },
+    "filesystem": {
+      "denyRead": [
+        "~/.ssh",
+        "~/.aws",
+        "~/.gnupg",
+        "~/.config/gcloud",
+        "~/.kube",
+        "~/.docker",
+        "~/.vibebox/login",
+        "~/.vibebox/llm.env",
+        "~/.local/share/opencode",
+        "~/projects_linux/no-sniff"
+      ]
+    }
+  }
+}

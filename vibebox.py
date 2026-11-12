@@ -24,6 +24,14 @@ from trace_proxy import local_base_url
 # Real repo dir even when run through the ~/.local/bin/vibe symlink.
 REPO = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_IMAGE = "vibebox:latest"
+# ChatGPT-subscription login (opencode's built-in Codex plugin): login + model hosts.
+OPENAI_HOSTS = ["auth.openai.com", "chatgpt.com"]
+OPENAI_LOGIN = os.path.join(os.path.expanduser("~"), ".vibebox", "login", "openai")
+OC_DATA_IN_BOX = "/home/vibe/.local/share/opencode"
+# Claude Code with the user's Claude subscription: login + API + token refresh hosts.
+CLAUDE_HOSTS = ["api.anthropic.com", "claude.ai", "claude.com", "platform.claude.com"]
+CLAUDE_LOGIN = os.path.join(os.path.expanduser("~"), ".vibebox", "login", "claude")
+CLAUDE_CFG_IN_BOX = "/home/vibe/.claude-login"
 
 
 def to_podman_size(value):
@@ -52,7 +60,11 @@ class Options:
     llm_key: bool = False     # pass LOCAL_LLM_API_KEY by NAME (value via env, not argv)
     oc_config: str = ""       # inline JSON -> OPENCODE_CONFIG_CONTENT (extra models)
     trace_dir: str = ""       # host dir -> /trace; LLM calls go via the in-box trace proxy
+    proxy_ip: str = ""        # this session's own allowlist proxy (default: PROXY_IP)
     ro: Optional[List[str]] = None  # None: /work rw | []: whole /work ro | [subdirs]: only those ro
+    openai_login: str = ""    # host dir with ONLY the box's ChatGPT login -> opencode data dir
+    claude: bool = False      # entry = Claude Code (no prompts: the box is the boundary)
+    claude_login: str = ""    # host dir with ONLY the box's Claude login -> CLAUDE_CONFIG_DIR
 
 
 def build_podman_command(opts):
@@ -71,11 +83,13 @@ def build_podman_command(opts):
     # Block dmesg (kernel-log leak) and shave the loudest container tells.
     cmd += ["--security-opt", f"seccomp={SECCOMP}",
             "--hostname", opts.hostname, "-e", "container="]
-    cmd += _network_args(opts.net)
+    cmd += _network_args(opts.net, opts.proxy_ip or PROXY_IP)
     cmd += _limit_args(opts)
     if opts.gpu:
         cmd += ["--device", "nvidia.com/gpu=all"]
     entry = ["opencode" if opts.opencode else "bash"]
+    if opts.claude:
+        entry = ["claude", "--dangerously-skip-permissions"]
     if opts.trace_dir and opts.llm_url:
         # opencode talks plain HTTP to the logging proxy on loopback; the proxy
         # forwards to the real URL (through HTTPS_PROXY in allowlist mode).
@@ -96,6 +110,16 @@ def build_podman_command(opts):
         cmd += ["-e", "LOCAL_LLM_API_KEY"]
     if opts.oc_config:
         cmd += ["-e", f"OPENCODE_CONFIG_CONTENT={opts.oc_config}"]
+    if opts.openai_login:
+        # A dedicated login dir (never the host's opencode data), and the built-in
+        # plugins back on: the ChatGPT login lives in one of them.
+        cmd += ["-v", f"{opts.openai_login}:{OC_DATA_IN_BOX}:rw",
+                "-e", "OPENCODE_DISABLE_DEFAULT_PLUGINS=false"]
+    if opts.claude_login:
+        # Claude Code keeps ALL its state (incl. .claude.json, .credentials.json) here.
+        cmd += ["-v", f"{opts.claude_login}:{CLAUDE_CFG_IN_BOX}:rw",
+                "-e", f"CLAUDE_CONFIG_DIR={CLAUDE_CFG_IN_BOX}",
+                "-e", f"VIBEBOX_NET={net_mode(opts.net)}"]
     return cmd + [opts.image] + entry
 
 
@@ -249,6 +273,70 @@ def resolve_ro(work, paths):
     return subs, ""
 
 
+BOX_STATUSLINE = "/usr/local/lib/vibebox/statusline.sh"
+OUT_DIR = "vibe-out"
+
+
+def ensure_claude_settings(login_dir):
+    """Give the box's Claude Code our status line, keeping any other settings."""
+    f = os.path.join(login_dir, "settings.json")
+    try:
+        cfg = json.loads(Path(f).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cfg = {}
+    if cfg.get("statusLine", {}).get("command") != BOX_STATUSLINE:
+        cfg["statusLine"] = {"type": "command", "command": BOX_STATUSLINE}
+        Path(f).write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    return login_dir
+
+
+HOST_DIR = os.path.join(REPO, "host")
+
+
+def merge_settings(current, extra):
+    """Add extra's settings to current: lists are unioned (nothing removed), nested
+    objects merged, plain values from extra win."""
+    out = dict(current)
+    for k, v in extra.items():
+        if isinstance(v, dict):
+            out[k] = merge_settings(out.get(k) or {}, v)
+        elif isinstance(v, list):
+            cur = list(out.get(k) or [])
+            out[k] = cur + [x for x in v if x not in cur]
+        else:
+            out[k] = v
+    return out
+
+
+def setup_claude(claude_dir=None):
+    """Apply host/claude-settings.json (deny lists, ask rules, sandbox) and the
+    status line to this laptop's Claude Code. Backs up what it changes."""
+    claude_dir = claude_dir or os.path.join(os.path.expanduser("~"), ".claude")
+    os.makedirs(claude_dir, exist_ok=True)
+    f = os.path.join(claude_dir, "settings.json")
+    try:
+        cur = json.loads(Path(f).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        cur = {}
+    extra = json.loads(Path(HOST_DIR, "claude-settings.json").read_text(encoding="utf-8"))
+    sl = os.path.join(claude_dir, "statusline-command.sh")
+    for path in (f, sl):
+        if os.path.exists(path):
+            shutil.copyfile(path, path + ".bak")
+    shutil.copyfile(os.path.join(HOST_DIR, "statusline.sh"), sl)
+    os.chmod(sl, 0o755)
+    extra["statusLine"] = {"type": "command", "command": sl}
+    Path(f).write_text(json.dumps(merge_settings(cur, extra), indent=2) + "\n", encoding="utf-8")
+    return f
+
+
+def ensure_login_dir(path):
+    """Private (0700) dir that holds only the box's own login, never the host's."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
 def install(bin_dir=None, name="vibe"):
     """Symlink <bin_dir>/vibe -> this script (real path). Idempotent."""
     bin_dir = bin_dir or os.path.join(os.path.expanduser("~"), ".local", "bin")
@@ -336,8 +424,7 @@ def _ensure_network(name, internal=False):
                               "{{.DNSEnabled}} {{range .Subnets}}{{.Subnet}}{{end}}"],
                              capture_output=True, text=True).stdout.split()
         if out != ["false", INTERNAL_SUBNET]:
-            subprocess.run(["podman", "rm", "-f", PROXY],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            remove_proxies()
             subprocess.run(["podman", "network", "rm", name], check=True,
                            stdout=subprocess.DEVNULL)
             exists = False
@@ -389,18 +476,43 @@ def machine_resources():
         return ""
 
 
+# Every vibe session gets its OWN proxy (name, IP, allowlist), so two sessions with
+# different allowlists (e.g. -openai and -claude) never overwrite each other.
+PROXY_SLOTS = range(200, 250)
+
+
+def proxy_names():
+    out = subprocess.run(["podman", "ps", "-a", "--format", "{{.Names}}"],
+                         capture_output=True, text=True).stdout.split()
+    return [n for n in out if n == PROXY or n.startswith(PROXY + "-")]
+
+
+def remove_proxies():
+    for n in proxy_names():
+        subprocess.run(["podman", "rm", "-f", n],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def setup_allow_proxy(domains, image, log_file):
+    """Start this session's proxy in a free slot. Returns (name, ip)."""
     _ensure_network(EGRESS)
     _ensure_network(INTERNAL, internal=True)
     troot = _temp_root()
     os.makedirs(troot, exist_ok=True)
-    allow_file = os.path.join(troot, "allow.txt")
-    Path(allow_file).write_text("\n".join(allowlist_regex_lines(domains)) + "\n",
-                                encoding="ascii")
     conf = os.path.join(REPO, "tinyproxy.conf")
-    subprocess.run(["podman", "rm", "-f", PROXY], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(build_proxy_command(image, allow_file, conf, log_file),
-                   check=True, stdout=subprocess.DEVNULL)
+    taken = set(proxy_names())
+    for n in PROXY_SLOTS:
+        name, ip = f"{PROXY}-{n}", f"10.213.0.{n}"
+        if name in taken:
+            continue
+        allow_file = os.path.join(troot, f"allow-{n}.txt")
+        Path(allow_file).write_text("\n".join(allowlist_regex_lines(domains)) + "\n",
+                                    encoding="ascii")
+        r = subprocess.run(build_proxy_command(image, allow_file, conf, log_file, name, ip),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if r.returncode == 0:
+            return name, ip
+    raise RuntimeError("no free proxy slot; run 'vibe -stop-proxy'")
 
 
 def main(argv=None):
@@ -418,6 +530,19 @@ def main(argv=None):
     p.add_argument("-ro", nargs="*", default=None, metavar="SUBDIR",
                    help="read-only: '-ro' alone = whole folder; '-ro docs data' = only "
                         "those subfolders, the rest stays writable")
+    p.add_argument("-openai", action="store_true",
+                   help="ChatGPT subscription: login kept in ~/.vibebox/login/openai, "
+                        "allowlist + auth.openai.com chatgpt.com. First time: /connect in "
+                        "opencode -> OpenAI -> ChatGPT Pro/Plus (headless)")
+    p.add_argument("-claude", action="store_true",
+                   help="Claude Code with your Claude subscription. Login kept in "
+                        "~/.vibebox/login/claude; allowlist = Anthropic hosts only")
+    p.add_argument("-out", action="store_true",
+                   help="mount ONLY a new empty ./vibe-out folder: the agent can't see "
+                        "the rest of the project; what it makes lands in vibe-out/")
+    p.add_argument("-setup-claude", dest="setup_claude", action="store_true",
+                   help="apply vibebox's Claude Code security setup to THIS laptop: "
+                        "deny lists, ask rules, sandbox on, status line (backs up first)")
     p.add_argument("-gpu", action="store_true")
     p.add_argument("-ram", default="")
     p.add_argument("-cpu", type=int, default=0)
@@ -469,11 +594,17 @@ def main(argv=None):
         print(egress_summary(text))
         return 0
 
+    if args.setup_claude:
+        f = setup_claude()
+        print(f"vibebox: Claude Code security setup applied to {f} (backup: {f}.bak). "
+              "Restart Claude Code.")
+        return 0
     if args.stop_proxy:
-        subprocess.run(["podman", "rm", "-f", PROXY])
+        remove_proxies()
         print("proxy removed")
         return 0
     if args.clean:
+        remove_proxies()
         for c in build_clean_commands(args.image):
             subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         shutil.rmtree(_temp_root(), ignore_errors=True)
@@ -491,26 +622,43 @@ def main(argv=None):
     if err:
         print(f"vibebox: {err}", file=sys.stderr)
         return 2
+    mount = work                       # what becomes /work
+    if args.out:
+        if args.ro is not None:
+            print("vibebox: -out already hides the project; drop -ro", file=sys.stderr)
+            return 2
+        mount = os.path.join(work, OUT_DIR)
+        os.makedirs(mount, exist_ok=True)
 
+    args.llm_given = args.llm is not None
     cfg = resolve_llm({"LOCAL_LLM_URL": args.llm, "LOCAL_LLM_MODEL": args.model},
                       os.environ, load_llm_env(LLM_ENV))
     args.llm, model, key = cfg["LOCAL_LLM_URL"], cfg["LOCAL_LLM_MODEL"], cfg["LOCAL_LLM_API_KEY"]
-    if not args.llm:
+    if args.claude:
+        if args.openai or args.trace or args.llm_given:
+            print("vibebox: -claude can't be combined with -openai, -trace or -llm",
+                  file=sys.stderr)
+            return 2
+        args.llm, model, key = None, "", ""      # least privilege: no Scaleway key, no host
+    elif not args.llm:
         print(f"vibebox: no LLM URL; set -llm, $LOCAL_LLM_URL or LOCAL_LLM_URL in {LLM_ENV}"
               " (starting a shell)", file=sys.stderr)
     # Default entry: opencode when an LLM is configured, else a shell.
-    opencode = not args.sh and (args.opencode or bool(args.llm))
+    opencode = not args.sh and (args.opencode or bool(args.llm) or args.openai)
     llm = urlsplit(args.llm)
     llm_host = llm.hostname or ""
     if args.llm and not llm_host:
         print(f"vibebox: can't parse -llm URL {args.llm!r} "
               "(use e.g. http://100.x.y.z:8080/v1)", file=sys.stderr)
         return 2
-    net, domains, unknown = resolve_net(args.net, opencode, llm_host)
+    if args.claude:
+        opencode = False
+    extra = OPENAI_HOSTS if args.openai else CLAUDE_HOSTS if args.claude else ()
+    net, domains, unknown = resolve_net(args.net, opencode, llm_host, extra)
     for u in unknown:
         print(f"vibebox: unknown -net '{u}' ignored (not a keyword or domain)", file=sys.stderr)
     tokens = [t.lower() for t in net]
-    if llm_host and "none" in tokens:
+    if (llm_host or args.openai or args.claude) and "none" in tokens:
         print("vibebox: -llm needs network but -net none is air-gapped; "
               "use -net full or add hosts to an allowlist", file=sys.stderr)
         return 2
@@ -525,37 +673,50 @@ def main(argv=None):
             return 2
         trace_dir = new_trace_dir(project_name(work))
     log_file = ""
+    proxy_name, proxy_ip = "", ""
     if "none" not in tokens and "full" not in tokens:  # allow-list mode
         if llm_host and llm.scheme == "https" and llm.port not in (None, 443):
             print("vibebox: proxy only tunnels HTTPS on port 443; "
                   "use http:// or -net full for this -llm URL", file=sys.stderr)
         log_file = new_egress_log()
-        setup_allow_proxy(domains, args.image, log_file)
+        proxy_name, proxy_ip = setup_allow_proxy(domains, args.image, log_file)
 
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     project = project_name(work)
     host = re.sub(r"[^A-Za-z0-9-]", "-", project).strip("-") or "devbox"
-    opts = Options(work=work, image=args.image, net=net, ram=args.ram,
+    opts = Options(work=mount, image=args.image, net=net, ram=args.ram,
                    cpu=args.cpu, disk=args.disk, gpu=args.gpu, interactive=interactive,
                    hostname=host, opencode=opencode, llm_url=args.llm,
                    llm_model=model, llm_key=bool(key), oc_config=oc_config,
-                   trace_dir=trace_dir, ro=ro)
+                   trace_dir=trace_dir, ro=ro, proxy_ip=proxy_ip,
+                   openai_login=ensure_login_dir(OPENAI_LOGIN) if args.openai else "",
+                   claude=args.claude and not args.sh,
+                   claude_login=ensure_claude_settings(ensure_login_dir(CLAUDE_LOGIN))
+                   if args.claude else "")
     cmd = build_podman_command(opts)
     res = machine_resources()
     entry = "opencode" if opencode else "shell (run 'opencode')"
     models = f" (+{n_models - 1} more: /models)" if n_models > 1 else ""
-    print(f"vibe: {entry} | model={model or 'local'}{models} | net={net_mode(net)}")
+    if args.claude:
+        entry = "claude code (your Claude login; first time: /login)" if not args.sh \
+            else "shell (run 'claude --dangerously-skip-permissions')"
+        print(f"vibe: {entry} | net={net_mode(net)}")
+    else:
+        print(f"vibe: {entry} | model={model or 'local'}{models} | net={net_mode(net)}")
     ro_note = "" if ro is None else (" (READ-ONLY)" if ro == [] else
                                      " (read-only: " + ", ".join(ro) + ")")
-    print(f"      {work} -> /work{ro_note}{' | gpu' if args.gpu else ''}{' | ' + res if res else ''}"
+    if args.out:
+        ro_note = " (ONLY this folder: the rest of the project is invisible)"
+    print(f"      {mount} -> /work{ro_note}{' | gpu' if args.gpu else ''}{' | ' + res if res else ''}"
           f"{' | log: ' + log_file if log_file else ''}"
           f"{' | trace: ' + trace_dir if trace_dir else ''}")
     env = dict(os.environ, LOCAL_LLM_API_KEY=key) if key else None
-    herdr = opencode and os.environ.get("HERDR_ENV") == "1"
+    agent = "claude" if opts.claude else "opencode" if opencode else ""
+    herdr = bool(agent) and os.environ.get("HERDR_ENV") == "1"
     if herdr:
         # herdr finds agents by the pane's foreground process (podman here); this
         # hint makes it read opencode's screen for idle/working/blocked state.
-        env = dict(env or os.environ, HERDR_AGENT="opencode")
+        env = dict(env or os.environ, HERDR_AGENT=agent)
         reach = ", ".join(domains) if log_file else net_mode(net).split(" ")[0]
         herdr_report(os.environ, herdr_metadata_args(
             os.environ.get("HERDR_PANE_ID", ""),
@@ -576,6 +737,9 @@ def main(argv=None):
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
             except Exception:
                 pass
+        if proxy_name:   # this session's proxy goes away with the session
+            subprocess.run(["podman", "rm", "-f", proxy_name],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if log_file and os.path.exists(log_file):
             text = Path(log_file).read_text(encoding="utf-8", errors="replace")
             print(f"vibebox: {egress_summary(text)}  [{log_file}]")
@@ -620,12 +784,12 @@ HARDENING = ["--cap-drop=ALL", "--security-opt", "no-new-privileges"]
 SECCOMP = os.path.join(REPO, "seccomp.json")
 
 
-def build_proxy_command(image, allow_file, conf, log_file):
+def build_proxy_command(image, allow_file, conf, log_file, name=None, ip=None):
     """tinyproxy sidecar: bridges egress+internal nets (fixed IP on internal),
     hardened, allowlist mounted ro, request log written to a host file."""
     return [
-        "podman", "run", "-d", "--name", PROXY,
-        "--network", EGRESS, "--network", f"{INTERNAL}:ip={PROXY_IP}",
+        "podman", "run", "-d", "--name", name or PROXY,
+        "--network", EGRESS, "--network", f"{INTERNAL}:ip={ip or PROXY_IP}",
         *HARDENING,
         "-v", f"{allow_file}:/etc/tinyproxy/allow.txt:ro",
         "-v", f"{conf}:/etc/tinyproxy/tinyproxy.conf:ro",
@@ -678,7 +842,8 @@ def expand_allowlist(tokens):
     return domains, unknown
 
 
-def _network_args(net):
+def _network_args(net, proxy_ip=None):
+    proxy_ip = proxy_ip or PROXY_IP
     tokens = [t.lower() for t in net]
     if "none" in tokens:
         return ["--network=none"]
@@ -686,28 +851,30 @@ def _network_args(net):
         return []
     # allow-list mode: internal (no-egress, no-DNS) net; the proxy is the only way
     # out. --dns=none: no resolv.conf; the proxy resolves allowed hosts itself.
-    proxy_url = f"http://{PROXY_IP}:{PROXY_PORT}"
-    args = ["--network", INTERNAL, "--dns=none", "--add-host", f"{PROXY}:{PROXY_IP}"]
+    proxy_url = f"http://{proxy_ip}:{PROXY_PORT}"
+    args = ["--network", INTERNAL, "--dns=none", "--add-host", f"{PROXY}:{proxy_ip}"]
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         args += ["-e", f"{var}={proxy_url}"]
     return args + ["-e", "NO_PROXY=localhost,127.0.0.1", "-e", "no_proxy=localhost,127.0.0.1"]
 
 
-def resolve_net(net_arg, opencode=False, llm_host=""):
+def resolve_net(net_arg, opencode=False, llm_host="", extra=()):
     """-net tokens -> (net, allowed_domains, unknown). No -net + an LLM URL =
     locked down: allowlist of ONLY the LLM host. In any allowlist the LLM host is
     added automatically; an allowlist that ends up empty falls back to full."""
     if net_arg is None:
-        if llm_host:
-            return [llm_host], [llm_host], []
+        hosts = ([llm_host] if llm_host else []) + list(extra)
+        if hosts:
+            return hosts, list(hosts), []
         net_arg = ["full"]
     # Flatten nargs list, splitting any element that itself holds a comma/space list.
     net = [t for chunk in net_arg for t in re.split(r"[ ,]+", chunk) if t]
     domains, unknown = expand_allowlist(net)
     tokens = [t.lower() for t in net]
     if tokens and "none" not in tokens and "full" not in tokens:  # allow-list mode
-        if llm_host and llm_host not in domains:
-            domains.append(llm_host)
+        for h in ([llm_host] if llm_host else []) + list(extra):
+            if h not in domains:
+                domains.append(h)
         if not domains:
             print("vibebox: empty allowlist; using full network", file=sys.stderr)
             net = ["full"]

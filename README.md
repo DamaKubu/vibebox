@@ -111,7 +111,16 @@ vibe -llm http://100.x.y.z:8080/v1 -net pypi -ram 5GB   # other LLM, + pypi, lim
 vibe -sh -net none                                  # air-gapped shell (no LLM)
 vibe -ro                                            # whole folder read-only (review, explain)
 vibe -ro docs data/raw                              # only these subfolders read-only, rest writable
+vibe -out                                           # agent sees ONLY a new empty ./vibe-out folder
+vibe -openai                                        # + your ChatGPT subscription (GPT in /models)
+vibe -claude                                        # Claude Code with your Claude subscription
+vibe -claude -net pypi                              # ... plus pip/uv installs
 ```
+Inside opencode, **Tab** switches mode: **agent** (full: read, edit, run) → **write**
+(can only create files, can't read or run anything) → **chat** (no tools at all).
+
+Every session gets its own allowlist proxy, so `vibe -openai` and `vibe -claude`
+can run at the same time without touching each other's network rules.
 Other flags: `-model ID`, `-gpu`, `-cpu N`, `-disk 10GB`, `-log`, `-stop-proxy`, `-clean`.
 
 ### Trace mode (learn how the agent works)
@@ -233,6 +242,33 @@ JS, add it per project — e.g. download a Node tarball into `/work` with
 `-net full` (or allowlist `nodejs.org,npm`), or build a derived image
 `FROM vibebox:latest` that installs it.
 
+
+## Subscriptions (ChatGPT, Claude)
+Logins never come from the host. Each box logs in once, into its own folder:
+
+| | First time, inside the box | Login stored in | Allowlist |
+|---|---|---|---|
+| `vibe -openai` | `/connect` → OpenAI → **ChatGPT Pro/Plus (headless)**, enter the code at auth.openai.com/codex/device | `~/.vibebox/login/openai` | + `auth.openai.com`, `chatgpt.com` |
+| `vibe -claude` | `/login`, open the URL, paste the code back | `~/.vibebox/login/claude` | only `api.anthropic.com`, `claude.ai`, `claude.com`, `platform.claude.com` |
+
+Headless ChatGPT login needs "device code sign-in" enabled once in ChatGPT → Settings →
+Security. Browser logins (callback to `localhost:1455`) can't work: the box's localhost
+isn't your laptop's. A login folder holds a live token: treat it like a password.
+
+Claude Code in the box runs with `--dangerously-skip-permissions` (the box is the
+boundary), pinned version + pinned SHA256, no updates, telemetry or error reports.
+
+## Same setup on another laptop
+```bash
+git clone https://github.com/DamaKubu/vibebox && cd vibebox
+./vibebox.py -install          # puts `vibe` on PATH
+vibe -setup-claude             # Claude Code on the HOST: sandbox on, deny lists, ask rules, status line
+```
+`-setup-claude` only **adds** to `~/.claude/settings.json` (backup in `settings.json.bak`):
+secret folders unreadable (`~/.ssh`, `~/.vibebox/login`, `~/.vibebox/llm.env`, ...),
+leaving the sandbox / `git push` / editing Claude's own rules need your click.
+Edit `host/claude-settings.json` to change the lists. Then: create `~/.vibebox/llm.env`
+(Scaleway) and log in once with `vibe -openai` / `vibe -claude`.
 
 ## Credentials
 None by default. The box gets no logins from the host. The only things passed in
