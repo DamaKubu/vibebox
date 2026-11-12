@@ -115,7 +115,16 @@ vibe -out                                           # agent sees ONLY a new empt
 vibe -openai                                        # + your ChatGPT subscription (GPT in /models)
 vibe -claude                                        # Claude Code with your Claude subscription
 vibe -claude -net pypi                              # ... plus pip/uv installs
+vibe -c                                             # continue this project's last chat (any mode)
+vibe -forget                                        # delete this project's saved chats
 ```
+Chats are saved **in the project** under `.vibe/` (private, gitignored, masked from
+the agent's `/work`); login tokens stay in `~/.vibebox/login`. `vibe` and `vibe -openai`
+share the opencode history, so a chat started with GPT can be continued with Qwen.
+`vibe -openai` starts on `gpt-6-sol` (gpt-5.x models are refused on ChatGPT plans).
+
+PDFs: `pdf2txt file.pdf` → `file.txt`. Text PDFs via pdftotext; scanned pages get OCR
+(Tesseract, Lithuanian by default; `PDF2TXT_LANG=eng` or `lit+eng`).
 Inside opencode, **Tab** switches mode: **agent** (full: read, edit, run) → **write**
 (can only create files, can't read or run anything) → **chat** (no tools at all).
 

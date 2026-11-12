@@ -798,8 +798,11 @@ def test_resolve_ro(tmp_path):
 def test_openai_login_dir_and_plugins_only_when_asked():
     plain = cmd()
     assert not any("OPENCODE_DISABLE_DEFAULT_PLUGINS" in a for a in plain)
-    c = cmd(openai_login="/home/me/.vibebox/login/openai")
-    assert "/home/me/.vibebox/login/openai:/home/vibe/.local/share/opencode:rw" in mounts_of(c)
+    c = cmd(openai_login="/home/me/.vibebox/login/openai", chats="/home/me/proj/.vibe")
+    # chats from the project, ONLY the token file from the login dir
+    assert "/home/me/proj/.vibe/opencode:/home/vibe/.local/share/opencode:rw" in mounts_of(c)
+    assert ("/home/me/.vibebox/login/openai/auth.json:"
+            "/home/vibe/.local/share/opencode/auth.json:rw") in mounts_of(c)
     assert "OPENCODE_DISABLE_DEFAULT_PLUGINS=false" in c
 
 
@@ -875,7 +878,9 @@ def test_out_mounts_only_vibe_out(monkeypatch, tmp_path):
                         lambda c, **kw: (ran.append(c), type("R", (), {"returncode": 0})())[1])
     assert vibebox.main(["-out", "-sh", "-net", "none"]) == 0
     box = [c for c in ran if c[:2] == ["podman", "run"]][-1]
-    assert mounts_of(box) == [f"{tmp_path}/vibe-out:/work:rw"]
+    m = mounts_of(box)
+    assert m[0] == f"{tmp_path}/vibe-out:/work:rw"                 # the only PROJECT mount
+    assert all(x.startswith(f"{tmp_path}/.vibe/") for x in m[1:])   # + the harness's chat store
     assert (tmp_path / "vibe-out").is_dir()
     assert vibebox.main(["-out", "-ro"]) == 2
 
@@ -920,3 +925,42 @@ def test_setup_claude_on_fresh_and_existing(tmp_path):
     cfg = _j.loads((d / "settings.json").read_text())
     assert cfg["theme"] == "light" and "Read(~/x)" in cfg["permissions"]["deny"]
     assert (d / "settings.json.bak").exists()
+
+
+def test_openai_starts_on_gpt6_sol_keeping_other_models():
+    import json as _j
+    from vibebox import with_default_model, OPENAI_DEFAULT_MODEL
+    assert OPENAI_DEFAULT_MODEL == "openai/gpt-6-sol"
+    base = _j.dumps({"provider": {"local": {"models": {"qwen": {}}}}})
+    cfg = _j.loads(with_default_model(base, OPENAI_DEFAULT_MODEL))
+    assert cfg["model"] == "openai/gpt-6-sol" and "qwen" in cfg["provider"]["local"]["models"]
+    assert _j.loads(with_default_model("", "x/y")) == {"model": "x/y"}
+
+
+# --- chats saved in the project (.vibe), -c to continue, -forget ---------------
+
+def test_chats_in_project_hidden_from_agent_and_continue():
+    c = cmd(opencode=True, chats="/home/me/proj/.vibe", hide_chats=True, resume=True)
+    assert "/home/me/proj/.vibe/opencode:/home/vibe/.local/share/opencode:rw" in mounts_of(c)
+    assert "type=tmpfs,destination=/work/.vibe" in c          # agent sees an empty .vibe
+    assert c[-2:] == ["opencode", "--continue"]
+    c = cmd(claude=True, claude_login="/l/claude", chats="/home/me/proj/.vibe", resume=True)
+    assert "/home/me/proj/.vibe/claude:/home/vibe/.claude-login/projects:rw" in mounts_of(c)
+    assert c[-3:] == ["claude", "--dangerously-skip-permissions", "--continue"]
+    assert cmd(resume=True)[-1] == "bash"                     # a shell has nothing to continue
+
+
+def test_chats_dir_is_private_and_gitignored(tmp_path):
+    from vibebox import ensure_chats_dir
+    d = ensure_chats_dir(str(tmp_path))
+    assert oct(os.stat(d).st_mode & 0o777) == "0o700"
+    assert (tmp_path / ".vibe" / ".gitignore").read_text().strip().endswith("*")
+    assert (tmp_path / ".vibe" / "opencode").is_dir() and (tmp_path / ".vibe" / "claude").is_dir()
+
+
+def test_forget_deletes_project_chats(monkeypatch, tmp_path):
+    import vibebox
+    (tmp_path / ".vibe" / "opencode").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    assert vibebox.main(["-forget"]) == 0
+    assert not (tmp_path / ".vibe").exists()

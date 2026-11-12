@@ -4,6 +4,7 @@ Environment:
 - The project is at /work. That is the only place you work.
 - There is no internet. Never fetch URLs or try to download anything.
 - Tools: git, python3, uv, gcc/make, rg, fd, jq, sqlite3.
+- PDFs: `pdf2txt file.pdf` writes file.txt (scanned pages get OCR in Lithuanian; for English docs: PDF2TXT_LANG=eng pdf2txt file.pdf).
 
 How to work:
 - Use the tools to act. Do not ask the user for permission or confirmation.

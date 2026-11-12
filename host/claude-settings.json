@@ -10,7 +10,8 @@
       "Read(~/.vibebox/login/**)",
       "Read(~/.vibebox/llm.env)",
       "Read(~/.local/share/opencode/**)",
-      "Read(~/projects_linux/no-sniff/**)"
+      "Read(~/projects_linux/no-sniff/**)",
+      "Read(**/.vibe/**)"
     ],
     "ask": [
       "Bash(git push:*)",

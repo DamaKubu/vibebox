@@ -1,0 +1,23 @@
+#!/bin/sh
+# pdf2txt FILE.pdf [OUT.txt]
+# Text from any PDF. Text PDFs: pdftotext (exact, keeps layout, UTF-8 so ą č ę ė į š ų ū ž
+# are fine). Scanned PDFs: if pages carry almost no text, OCR them with Tesseract
+# (Lithuanian by default; PDF2TXT_LANG=lit+eng for mixed, eng for English) and extract again.
+set -eu
+[ $# -ge 1 ] || { echo "usage: pdf2txt FILE.pdf [OUT.txt]" >&2; exit 2; }
+in="$1"
+out="${2:-${1%.[pP][dD][fF]}.txt}"
+lang="${PDF2TXT_LANG:-lit}"
+
+pdftotext -layout -enc UTF-8 "$in" "$out"
+pages=$(pdfinfo "$in" 2>/dev/null | awk '/^Pages:/ {print $2}')
+chars=$(tr -d '[:space:]' < "$out" | wc -m)
+if [ "$chars" -lt $(( ${pages:-1} * 100 )) ]; then
+    echo "pdf2txt: little text in $in (${chars} chars, ${pages:-?} pages): running OCR ($lang)..." >&2
+    tmp=$(mktemp --suffix=.pdf)
+    trap 'rm -f "$tmp"' EXIT
+    # --skip-text: pages that already have real text are kept, only image pages get OCR.
+    ocrmypdf -q -l "$lang" --skip-text "$in" "$tmp"
+    pdftotext -layout -enc UTF-8 "$tmp" "$out"
+fi
+echo "$out"

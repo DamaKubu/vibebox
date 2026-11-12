@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         unzip zip xz-utils patch \
         procps sqlite3 nano openssh-client \
         tinyproxy \
+        poppler-utils ocrmypdf tesseract-ocr-lit tesseract-ocr-eng \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
@@ -64,6 +65,10 @@ RUN chmod 755 /usr/local/lib/vibebox/statusline.sh
 ENV DISABLE_UPDATES=1 \
     DISABLE_TELEMETRY=1 \
     DISABLE_ERROR_REPORTING=1
+
+# pdf2txt: text PDFs via pdftotext, scanned pages via OCR (Lithuanian + English).
+COPY box/pdf2txt /usr/local/bin/pdf2txt
+RUN chmod 755 /usr/local/bin/pdf2txt
 
 # Python diagnostics without node: Astral's ty (Rust) as opencode's LSP. Tool env
 # lives outside $HOME so the uid-1000 user sees it; binary lands on PATH.

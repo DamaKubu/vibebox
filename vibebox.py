@@ -26,6 +26,7 @@ REPO = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_IMAGE = "vibebox:latest"
 # ChatGPT-subscription login (opencode's built-in Codex plugin): login + model hosts.
 OPENAI_HOSTS = ["auth.openai.com", "chatgpt.com"]
+OPENAI_DEFAULT_MODEL = "openai/gpt-6-sol"   # on the ChatGPT plan; gpt-5.x are refused there
 OPENAI_LOGIN = os.path.join(os.path.expanduser("~"), ".vibebox", "login", "openai")
 OC_DATA_IN_BOX = "/home/vibe/.local/share/opencode"
 # Claude Code with the user's Claude subscription: login + API + token refresh hosts.
@@ -65,6 +66,9 @@ class Options:
     openai_login: str = ""    # host dir with ONLY the box's ChatGPT login -> opencode data dir
     claude: bool = False      # entry = Claude Code (no prompts: the box is the boundary)
     claude_login: str = ""    # host dir with ONLY the box's Claude login -> CLAUDE_CONFIG_DIR
+    chats: str = ""           # <project>/.vibe on the host: this project's saved chats
+    hide_chats: bool = False  # mask /work/.vibe so the agent doesn't see its own history
+    resume: bool = False      # continue the last chat (opencode/claude --continue)
 
 
 def build_podman_command(opts):
@@ -90,6 +94,8 @@ def build_podman_command(opts):
     entry = ["opencode" if opts.opencode else "bash"]
     if opts.claude:
         entry = ["claude", "--dangerously-skip-permissions"]
+    if opts.resume and (opts.opencode or opts.claude):
+        entry = entry + ["--continue"]
     if opts.trace_dir and opts.llm_url:
         # opencode talks plain HTTP to the logging proxy on loopback; the proxy
         # forwards to the real URL (through HTTPS_PROXY in allowlist mode).
@@ -110,16 +116,27 @@ def build_podman_command(opts):
         cmd += ["-e", "LOCAL_LLM_API_KEY"]
     if opts.oc_config:
         cmd += ["-e", f"OPENCODE_CONFIG_CONTENT={opts.oc_config}"]
+    if opts.chats:
+        # This project's chats live in <project>/.vibe (gitignored), never in a
+        # shared folder. opencode's data dir = <project>/.vibe/opencode.
+        cmd += ["-v", f"{os.path.join(opts.chats, 'opencode')}:{OC_DATA_IN_BOX}:rw"]
+        if opts.hide_chats:   # the agent's /work view: an empty mask over .vibe
+            cmd += ["--mount", f"type=tmpfs,destination=/work/{CHATS_DIR}"]
     if opts.openai_login:
-        # A dedicated login dir (never the host's opencode data), and the built-in
-        # plugins back on: the ChatGPT login lives in one of them.
-        cmd += ["-v", f"{opts.openai_login}:{OC_DATA_IN_BOX}:rw",
-                "-e", "OPENCODE_DISABLE_DEFAULT_PLUGINS=false"]
+        # Only the token FILE comes from the login dir (opencode rewrites it in
+        # place, so a file mount survives refreshes); plugins on: the login lives there.
+        auth = os.path.join(opts.openai_login, "auth.json")
+        target = OC_DATA_IN_BOX if opts.chats else None
+        cmd += (["-v", f"{auth}:{target}/auth.json:rw"] if target else
+                ["-v", f"{opts.openai_login}:{OC_DATA_IN_BOX}:rw"])
+        cmd += ["-e", "OPENCODE_DISABLE_DEFAULT_PLUGINS=false"]
     if opts.claude_login:
-        # Claude Code keeps ALL its state (incl. .claude.json, .credentials.json) here.
+        # Claude Code keeps its login + settings here; its chats go to the project.
         cmd += ["-v", f"{opts.claude_login}:{CLAUDE_CFG_IN_BOX}:rw",
                 "-e", f"CLAUDE_CONFIG_DIR={CLAUDE_CFG_IN_BOX}",
                 "-e", f"VIBEBOX_NET={net_mode(opts.net)}"]
+        if opts.chats:
+            cmd += ["-v", f"{os.path.join(opts.chats, 'claude')}:{CLAUDE_CFG_IN_BOX}/projects:rw"]
     return cmd + [opts.image] + entry
 
 
@@ -225,6 +242,13 @@ def fetch_models(url, key, timeout=5):
         return parse_models(json.load(r))
 
 
+def with_default_model(oc_config, model):
+    """Inline opencode config with `model` as the starting model (/models still switches)."""
+    cfg = json.loads(oc_config) if oc_config else {}
+    cfg["model"] = model
+    return json.dumps(cfg)
+
+
 def model_config(url, model, key):
     """(OPENCODE_CONFIG_CONTENT json or "", model count). Never raises: on any
     failure, one warning line and the single LOCAL_LLM_MODEL from opencode.json."""
@@ -274,6 +298,29 @@ def resolve_ro(work, paths):
 
 
 BOX_STATUSLINE = "/usr/local/lib/vibebox/statusline.sh"
+CHATS_DIR = ".vibe"
+
+
+def ensure_chats_dir(project):
+    """<project>/.vibe with opencode/ and claude/ subfolders, ignored by git."""
+    d = os.path.join(project, CHATS_DIR)
+    for sub in ("opencode", "claude"):
+        os.makedirs(os.path.join(d, sub), mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    gi = os.path.join(d, ".gitignore")
+    if not os.path.exists(gi):
+        Path(gi).write_text("# vibe chat history: never commit\n*\n", encoding="utf-8")
+    return d
+
+
+def ensure_openai_auth(login_dir):
+    """The token file must exist to be mounted as a file (first login fills it)."""
+    f = os.path.join(login_dir, "auth.json")
+    if not os.path.exists(f):
+        fd = os.open(f, os.O_WRONLY | os.O_CREAT, 0o600)
+        os.write(fd, b"{}")
+        os.close(fd)
+    return login_dir
 OUT_DIR = "vibe-out"
 
 
@@ -543,6 +590,10 @@ def main(argv=None):
     p.add_argument("-setup-claude", dest="setup_claude", action="store_true",
                    help="apply vibebox's Claude Code security setup to THIS laptop: "
                         "deny lists, ask rules, sandbox on, status line (backs up first)")
+    p.add_argument("-c", dest="resume", action="store_true",
+                   help="continue the last chat of THIS project (saved in ./.vibe)")
+    p.add_argument("-forget", action="store_true",
+                   help="delete this project's saved chats (./.vibe) and exit")
     p.add_argument("-gpu", action="store_true")
     p.add_argument("-ram", default="")
     p.add_argument("-cpu", type=int, default=0)
@@ -622,6 +673,11 @@ def main(argv=None):
     if err:
         print(f"vibebox: {err}", file=sys.stderr)
         return 2
+    if args.forget:
+        d = os.path.join(work, CHATS_DIR)
+        shutil.rmtree(d, ignore_errors=True)
+        print(f"vibebox: deleted this project's saved chats ({d})")
+        return 0
     mount = work                       # what becomes /work
     if args.out:
         if args.ro is not None:
@@ -666,6 +722,8 @@ def main(argv=None):
         print("vibebox: image build failed", file=sys.stderr)
         return 1
     oc_config, n_models = model_config(args.llm, model, key) if args.llm else ("", 0)
+    if args.openai:
+        oc_config = with_default_model(oc_config, OPENAI_DEFAULT_MODEL)
     trace_dir = ""
     if args.trace:
         if not args.llm:
@@ -689,7 +747,10 @@ def main(argv=None):
                    hostname=host, opencode=opencode, llm_url=args.llm,
                    llm_model=model, llm_key=bool(key), oc_config=oc_config,
                    trace_dir=trace_dir, ro=ro, proxy_ip=proxy_ip,
-                   openai_login=ensure_login_dir(OPENAI_LOGIN) if args.openai else "",
+                   openai_login=ensure_openai_auth(ensure_login_dir(OPENAI_LOGIN))
+                   if args.openai else "",
+                   chats=ensure_chats_dir(work), hide_chats=not args.out,
+                   resume=args.resume,
                    claude=args.claude and not args.sh,
                    claude_login=ensure_claude_settings(ensure_login_dir(CLAUDE_LOGIN))
                    if args.claude else "")
