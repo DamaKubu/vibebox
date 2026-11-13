@@ -372,6 +372,16 @@ def setup_claude(claude_dir=None):
             shutil.copyfile(path, path + ".bak")
     shutil.copyfile(os.path.join(HOST_DIR, "statusline.sh"), sl)
     os.chmod(sl, 0o755)
+    esc = os.path.join(claude_dir, "vibe-escape.py")          # escape passes (+ hooks)
+    shutil.copyfile(os.path.join(HOST_DIR, "escape.py"), esc)
+    os.chmod(esc, 0o755)
+    bin_dir = os.path.join(os.path.dirname(claude_dir), ".local", "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    link = os.path.join(bin_dir, "vibe-off")                   # `vibe-off 1h` = sandbox off
+    if os.path.islink(link) or not os.path.exists(link):
+        if os.path.islink(link):
+            os.remove(link)
+        os.symlink(esc, link)
     extra["statusLine"] = {"type": "command", "command": sl}
     Path(f).write_text(json.dumps(merge_settings(cur, extra), indent=2) + "\n", encoding="utf-8")
     return f

@@ -59,4 +59,7 @@ if [ -n "$tp" ] && [ -d "$sub" ]; then
   done
   [ -n "$ag" ] && out="$out | agents ctx:$ag"
 fi
+# --- active sandbox escape pass (granted by you with vibe-escape)
+pass=$(python3 "$HOME/.claude/vibe-escape.py" status 2>/dev/null)
+[ -n "$pass" ] && out="$out | $pass"
 printf '%s' "$out"

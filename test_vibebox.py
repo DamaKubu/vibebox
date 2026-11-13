@@ -964,3 +964,48 @@ def test_forget_deletes_project_chats(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     assert vibebox.main(["-forget"]) == 0
     assert not (tmp_path / ".vibe").exists()
+
+
+# --- vibe-escape: temporary sandbox-exit pass -----------------------------------
+
+def _escape(monkeypatch, tmp_path):
+    import importlib.util, json as _j
+    spec = importlib.util.spec_from_file_location(
+        "esc", os.path.join(os.path.dirname(__file__), "host", "escape.py"))
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    monkeypatch.setattr(m, "SETTINGS", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(m, "PASS", str(tmp_path / "pass.json"))
+    (tmp_path / "settings.json").write_text(_j.dumps(
+        {"theme": "x", "permissions": {"ask": [m.RULE, "Bash(git push:*)"]}}))
+    return m, lambda: _j.loads((tmp_path / "settings.json").read_text())["permissions"]["ask"]
+
+
+def test_escape_pass_counts_down_and_restores(monkeypatch, tmp_path):
+    import io, json as _j
+    m, ask = _escape(monkeypatch, tmp_path)
+    m.grant("2")
+    assert m.RULE not in ask() and "Bash(git push:*)" in ask()     # pass: rule removed
+    for _ in range(2):
+        monkeypatch.setattr("sys.stdin", io.StringIO(_j.dumps(
+            {"tool_input": {"command": "ls", "dangerouslyDisableSandbox": True}})))
+        m.hook_post()
+    assert m.RULE in ask() and not (tmp_path / "pass.json").exists()   # used up: back
+
+
+def test_escape_pass_expires_and_session_start_restores(monkeypatch, tmp_path):
+    import json as _j
+    m, ask = _escape(monkeypatch, tmp_path)
+    m.grant("5m")
+    p = _j.loads((tmp_path / "pass.json").read_text()); p["until"] = 0
+    (tmp_path / "pass.json").write_text(_j.dumps(p))
+    assert m.active_pass() is None and m.RULE in ask()              # expired: back
+    m.grant("3"); m.restore("new session")
+    assert m.RULE in ask()
+
+
+def test_agents_cannot_grant_passes(monkeypatch, tmp_path, capsys):
+    import io, json as _j
+    m, _ = _escape(monkeypatch, tmp_path)
+    monkeypatch.setattr("sys.stdin", io.StringIO(_j.dumps({"tool_input": {"command": "vibe-escape 99"}})))
+    m.hook_pre()
+    assert _j.loads(capsys.readouterr().out)["hookSpecificOutput"]["permissionDecision"] == "deny"

@@ -11,7 +11,9 @@
       "Read(~/.vibebox/llm.env)",
       "Read(~/.local/share/opencode/**)",
       "Read(~/projects_linux/no-sniff/**)",
-      "Read(**/.vibe/**)"
+      "Read(**/.vibe/**)",
+      "Edit(~/.claude/escape-pass.json)",
+      "Edit(~/.claude/vibe-escape.py)"
     ],
     "ask": [
       "Bash(git push:*)",
@@ -43,5 +45,42 @@
         "~/projects_linux/no-sniff"
       ]
     }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/vibe-escape.py hook-pre",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/vibe-escape.py hook-post",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/vibe-escape.py session-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
   }
 }
